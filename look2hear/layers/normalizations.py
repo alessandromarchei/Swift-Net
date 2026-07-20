@@ -132,14 +132,39 @@ class CumulateLN(nn.Module):
         )
 
 class GlobalLayerNorm(nn.Module):
+    """Global layer normalization.
+
+    For 4D input (B, C, T, F) the statistics are computed **per time step**
+    over the channel and frequency dims (1, 3) only. The time dim (2) is kept
+    independent, so a frame's normalization never depends on future frames ->
+    causal / streaming safe. This is the frequency-wise global norm that
+    ``LayerNormalizationHW``/``cLNhw`` was intended to do (time is handled
+    causally afterwards by ``CumulateLN4D``).
+
+    For 3D input (B, C, T) it falls back to the original ``GroupNorm(1, C)``
+    behavior (global over C and T) so existing non-causal consumers of ``gLN``
+    keep identical outputs and checkpoint keys.
+    """
+
     def __init__(self, num_channels: int = 1, eps: float = EPS):
         super(GlobalLayerNorm, self).__init__()
         self.num_channels = num_channels
         self.eps = eps
 
+        # 3D path (unchanged): keeps params `norm.weight` / `norm.bias`.
         self.norm = nn.GroupNorm(num_groups=1, num_channels=self.num_channels, eps=self.eps)
 
+        # 4D causal path: per-frame affine over (C, F).
+        self.gamma = nn.Parameter(torch.ones(1, self.num_channels, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, self.num_channels, 1, 1))
+
     def forward(self, x: torch.Tensor):
+        if x.dim() == 4:
+            # x: (B, C, T, F) -> normalize over (C, F) at each time step
+            mean = x.mean(dim=(1, 3), keepdim=True)
+            var = x.var(dim=(1, 3), unbiased=False, keepdim=True)
+            x = (x - mean) / torch.sqrt(var + self.eps)
+            return x * self.gamma + self.beta
         return self.norm(x)
 
 
