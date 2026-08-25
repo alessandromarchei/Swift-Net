@@ -1238,7 +1238,16 @@ class STFTDecoder(nn.Module):
         if self.causal:
             decoded_separated_audio = decoded_separated_audio[:, :, :-self.padding, :]
 
-        spec = torch.complex(decoded_separated_audio[:, 0], decoded_separated_audio[:, 1])  # B*n_src, T, F
+        #prevent complex tensor from being casted eventually to bf16
+        with torch.autocast(
+            device_type=decoded_separated_audio.device.type,
+            enabled=False,
+        ):
+            real = decoded_separated_audio[:, 0].float()
+            imag = decoded_separated_audio[:, 1].float()
+            spec = torch.complex(real, imag)
+
+            
         # spec = torch.stack([spec.real, spec.imag], dim=-1)  # B*n_src, T, F
         spec = spec.transpose(1, 2).contiguous()  # B*n_src, F, T
         output = torch.istft(

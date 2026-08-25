@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import torch
 from torch import Tensor
 import argparse
@@ -16,91 +17,413 @@ from dataclasses import dataclass
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, RichProgressBar
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    EarlyStopping,
+    RichProgressBar,
+)
 from pytorch_lightning.callbacks.progress.rich_progress import *
 from rich.console import Console
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.loggers.wandb import WandbLogger
+from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies.ddp import DDPStrategy
 from rich import print, reconfigure
 from collections.abc import MutableMapping
-from look2hear.utils import print_only, MyRichProgressBar, RichProgressBarTheme
+from look2hear.utils import (
+    print_only,
+    MyRichProgressBar,
+    RichProgressBarTheme,
+)
 
 import warnings
 
 warnings.filterwarnings("ignore")
 
+
 parser = argparse.ArgumentParser()
+
 parser.add_argument(
     "--conf_dir",
     default="configs/lrs2_SwiftNet_6.yml",
-    help="Full path to save best validation model",
+    help="Path to the YAML configuration file.",
 )
 
-def main(config):
-    print_only(
-        "Instantiating datamodule <{}>".format(config["datamodule"]["data_name"])
+parser.add_argument(
+    "--ckpt_path",
+    type=str,
+    required=True,
+    help="Path to the Lightning checkpoint from which to resume training.",
+)
+
+parser.add_argument(
+    "--precision",
+    type=str,
+    default="32-true",
+    choices=["32-true", "bf16-mixed", "16-mixed"],
+    help=(
+        "Precision to use after resuming: "
+        "'32-true', 'bf16-mixed', or '16-mixed'."
+    ),
+)
+
+parser.add_argument(
+    "--tf32",
+    action="store_true",
+    help="Enable TF32 for FP32 matmul and CUDA convolutions.",
+)
+
+parser.add_argument(
+    "--torch_compile",
+    action="store_true",
+    help="Compile the LightningModule using torch.compile().",
+)
+
+parser.add_argument(
+    "--compile_mode",
+    type=str,
+    default="default",
+    choices=["default", "reduce-overhead", "max-autotune"],
+    help="Mode used by torch.compile().",
+)
+
+parser.add_argument(
+    "--wandb_run_id",
+    type=str,
+    default=None,
+    help=(
+        "ID of the original W&B run. If specified, new logs "
+        "continue in the same W&B run."
+    ),
+)
+
+
+def get_unique_experiment_name(base_name, experiments_root):
+    """
+    Returns a unique experiment name.
+
+    Example:
+        LRS2_SwiftNet_6
+        LRS2_SwiftNet_6-1
+        LRS2_SwiftNet_6-2
+    """
+    os.makedirs(experiments_root, exist_ok=True)
+
+    existing_names = set(os.listdir(experiments_root))
+
+    if base_name not in existing_names:
+        return base_name
+
+    pattern = re.compile(rf"^{re.escape(base_name)}-(\d+)$")
+    suffixes = []
+
+    for existing_name in existing_names:
+        match = pattern.match(existing_name)
+
+        if match:
+            suffixes.append(int(match.group(1)))
+
+    next_suffix = max(suffixes, default=0) + 1
+
+    while f"{base_name}-{next_suffix}" in existing_names:
+        next_suffix += 1
+
+    return f"{base_name}-{next_suffix}"
+
+
+def validate_checkpoint_path(checkpoint_path):
+    checkpoint_path = os.path.abspath(
+        os.path.expanduser(checkpoint_path)
     )
-    datamodule: object = getattr(look2hear.datas, config["datamodule"]["data_name"])(
+
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_path}"
+        )
+
+    if not checkpoint_path.endswith(".ckpt"):
+        print_only(
+            "Warning: the checkpoint does not end with '.ckpt'."
+        )
+
+    return checkpoint_path
+
+
+def configure_numerical_precision(tf32_enabled):
+    if not torch.cuda.is_available():
+        print_only("CUDA unavailable: ignoring TF32 configuration.")
+        return
+
+    if tf32_enabled:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        print_only("TF32 enabled for FP32 matmul and cuDNN convolutions.")
+    else:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+
+        print_only("TF32 disabled.")
+
+
+def build_wandb_logger(
+    experiment_name,
+    logger_dir,
+    config,
+    wandb_run_id=None,
+):
+    logger_kwargs = {
+        "name": experiment_name,
+        "project": "SwiftNet",
+        "save_dir": logger_dir,
+        "log_model": False,
+    }
+
+    if wandb_run_id is not None:
+        logger_kwargs["id"] = wandb_run_id
+        logger_kwargs["resume"] = "must"
+
+        print_only(
+            f"Resuming the same W&B run with ID: {wandb_run_id}"
+        )
+    else:
+        print_only(
+            "No W&B run ID specified: a new W&B run will be created "
+            "for the resumed training."
+        )
+
+    wandb_logger = WandbLogger(**logger_kwargs)
+    wandb_logger.log_hyperparams(config)
+
+    return wandb_logger
+
+
+def main(
+    config,
+    checkpoint_path,
+    precision,
+    tf32_enabled,
+    torch_compile_enabled,
+    compile_mode,
+    wandb_run_id,
+):
+    checkpoint_path = validate_checkpoint_path(checkpoint_path)
+
+    configure_numerical_precision(tf32_enabled)
+
+    # ------------------------------------------------------------------
+    # Unique directory for this training run
+    # ------------------------------------------------------------------
+    experiments_root = os.path.join(
+        os.getcwd(),
+        "Experiments",
+    )
+
+    base_experiment_name = config["exp"]["exp_name"]
+
+    experiment_name = get_unique_experiment_name(
+        base_name=base_experiment_name,
+        experiments_root=experiments_root,
+    )
+
+    config["exp"]["base_exp_name"] = base_experiment_name
+    config["exp"]["exp_name"] = experiment_name
+
+    # Main directory for this specific run
+    exp_dir = os.path.join(
+        experiments_root,
+        experiment_name,
+    )
+
+    # Checkpoints and local W&B files live inside the run directory
+    checkpoint_dir = os.path.join(
+        exp_dir,
+        "checkpoints",
+    )
+
+    wandb_dir = os.path.join(
+        exp_dir,
+        "wandb",
+    )
+
+    os.makedirs(checkpoint_dir, exist_ok=False)
+    os.makedirs(wandb_dir, exist_ok=True)
+
+    config["main_args"]["exp_dir"] = exp_dir
+    config["main_args"]["checkpoint_dir"] = checkpoint_dir
+    config["main_args"]["wandb_dir"] = wandb_dir
+
+    print_only(
+        f"Requested experiment name: {base_experiment_name}"
+    )
+    print_only(
+        f"Experiment name used: {experiment_name}"
+    )
+    print_only(
+        f"Experiment directory: {exp_dir}"
+    )
+    print_only(
+        f"Checkpoint directory: {checkpoint_dir}"
+    )
+    print_only(
+        f"W&B directory: {wandb_dir}"
+    )
+    print_only(
+        f"Checkpoint used for resuming: {checkpoint_path}"
+    )
+
+    config.setdefault("runtime", {})
+
+    config["runtime"]["resume_from_checkpoint"] = checkpoint_path
+    config["runtime"]["precision"] = precision
+    config["runtime"]["tf32"] = tf32_enabled
+    config["runtime"]["torch_compile"] = torch_compile_enabled
+    config["runtime"]["compile_mode"] = compile_mode
+    config["runtime"]["wandb_run_id"] = wandb_run_id
+
+    # ------------------------------------------------------------------
+    # DataModule
+    # ------------------------------------------------------------------
+    print_only(
+        "Instantiating datamodule <{}>".format(
+            config["datamodule"]["data_name"]
+        )
+    )
+
+    datamodule: object = getattr(
+        look2hear.datas,
+        config["datamodule"]["data_name"],
+    )(
         **config["datamodule"]["data_config"]
     )
+
     datamodule.setup()
 
     train_loader, val_loader, test_loader = datamodule.make_loader
-    # Define model and optimizer
+
+    # ------------------------------------------------------------------
+    # Audio model
+    # ------------------------------------------------------------------
     print_only(
-        "Instantiating AudioNet <{}>".format(config["audionet"]["audionet_name"])
+        "Instantiating AudioNet <{}>".format(
+            config["audionet"]["audionet_name"]
+        )
     )
-    model = getattr(look2hear.models, config["audionet"]["audionet_name"])(
+
+    model = getattr(
+        look2hear.models,
+        config["audionet"]["audionet_name"],
+    )(
         sample_rate=config["datamodule"]["data_config"]["sample_rate"],
         **config["audionet"]["audionet_config"],
     )
-    video_model = getattr(look2hear.videomodels, config["videonet"]["videonet_name"])(
+
+    # ------------------------------------------------------------------
+    # Video model
+    # ------------------------------------------------------------------
+    print_only(
+        "Instantiating VideoNet <{}>".format(
+            config["videonet"]["videonet_name"]
+        )
+    )
+
+    video_model = getattr(
+        look2hear.videomodels,
+        config["videonet"]["videonet_name"],
+    )(
         **config["videonet"]["videonet_config"],
     )
-    # import pdb; pdb.set_trace()
-    print_only("Instantiating Optimizer <{}>".format(config["optimizer"]["optim_name"]))
-    optimizer = make_optimizer(model.parameters(), **config["optimizer"])
 
-    # Define scheduler
+    # ------------------------------------------------------------------
+    # Optimizer
+    # ------------------------------------------------------------------
+    print_only(
+        "Instantiating Optimizer <{}>".format(
+            config["optimizer"]["optim_name"]
+        )
+    )
+
+    optimizer = make_optimizer(
+        model.parameters(),
+        **config["optimizer"],
+    )
+
+    # ------------------------------------------------------------------
+    # Scheduler
+    # ------------------------------------------------------------------
     scheduler = None
+
     if config["scheduler"]["sche_name"]:
         print_only(
-            "Instantiating Scheduler <{}>".format(config["scheduler"]["sche_name"])
-        )
-        scheduler = getattr(torch.optim.lr_scheduler, config["scheduler"]["sche_name"])(
-            optimizer=optimizer, **config["scheduler"]["sche_config"]
+            "Instantiating Scheduler <{}>".format(
+                config["scheduler"]["sche_name"]
+            )
         )
 
-    # Just after instantiating, save the args. Easy loading in the future.
-    config["main_args"]["exp_dir"] = os.path.join(
-        os.getcwd(), "Experiments", "checkpoint", config["exp"]["exp_name"]
-    )
-    exp_dir = config["main_args"]["exp_dir"]
-    os.makedirs(exp_dir, exist_ok=True)
+        scheduler = getattr(
+            torch.optim.lr_scheduler,
+            config["scheduler"]["sche_name"],
+        )(
+            optimizer=optimizer,
+            **config["scheduler"]["sche_config"],
+        )
+
+
     conf_path = os.path.join(exp_dir, "conf.yml")
-    with open(conf_path, "w") as outfile:
-        yaml.safe_dump(config, outfile)
 
-    # Define Loss function.
+    with open(conf_path, "w") as outfile:
+        yaml.safe_dump(
+            config,
+            outfile,
+            sort_keys=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Loss
+    # ------------------------------------------------------------------
     print_only(
         "Instantiating Loss, Train <{}>, Val <{}>".format(
-            config["loss"]["train"]["sdr_type"], config["loss"]["val"]["sdr_type"]
+            config["loss"]["train"]["sdr_type"],
+            config["loss"]["val"]["sdr_type"],
         )
     )
+
     loss_func = {
-        "train": getattr(look2hear.losses, config["loss"]["train"]["loss_func"])(
-            getattr(look2hear.losses, config["loss"]["train"]["sdr_type"]),
+        "train": getattr(
+            look2hear.losses,
+            config["loss"]["train"]["loss_func"],
+        )(
+            getattr(
+                look2hear.losses,
+                config["loss"]["train"]["sdr_type"],
+            ),
             **config["loss"]["train"]["config"],
         ),
-        "val": getattr(look2hear.losses, config["loss"]["val"]["loss_func"])(
-            getattr(look2hear.losses, config["loss"]["val"]["sdr_type"]),
+        "val": getattr(
+            look2hear.losses,
+            config["loss"]["val"]["loss_func"],
+        )(
+            getattr(
+                look2hear.losses,
+                config["loss"]["val"]["sdr_type"],
+            ),
             **config["loss"]["val"]["config"],
         ),
     }
 
-    print_only("Instantiating System <{}>".format(config["training"]["system"]))
-    system = getattr(look2hear.system, config["training"]["system"])(
+    # ------------------------------------------------------------------
+    # Lightning system
+    # ------------------------------------------------------------------
+    print_only(
+        "Instantiating System <{}>".format(
+            config["training"]["system"]
+        )
+    )
+
+    system = getattr(
+        look2hear.system,
+        config["training"]["system"],
+    )(
         audio_model=model,
         video_model=video_model,
         loss_func=loss_func,
@@ -112,80 +435,208 @@ def main(config):
         config=config,
     )
 
-    # Define callbacks
+    # ------------------------------------------------------------------
+    # Torch compile
+    # ------------------------------------------------------------------
+    if torch_compile_enabled:
+        if not hasattr(torch, "compile"):
+            raise RuntimeError(
+                "torch.compile non è disponibile in questa versione di PyTorch."
+            )
+
+        print_only(
+            f"Compiling model with torch.compile(mode='{compile_mode}')."
+        )
+
+        torch._dynamo.config.suppress_errors = True
+
+        system = torch.compile(
+            system,
+            mode=compile_mode,
+            fullgraph=False,
+        )
+    else:
+        print_only("torch.compile disabled.")
+
+    # ------------------------------------------------------------------
+    # Callbacks
+    # ------------------------------------------------------------------
     print_only("Instantiating ModelCheckpoint")
+
     callbacks = []
-    checkpoint_dir = os.path.join(exp_dir)
+
     checkpoint = ModelCheckpoint(
-        checkpoint_dir,
-        filename="{epoch}",
+        dirpath=checkpoint_dir,
+        filename="epoch-{epoch:03d}",
         monitor="val_loss/dataloader_idx_0",
         mode="min",
         save_top_k=5,
-        verbose=True,
         save_last=True,
+        verbose=True,
+        auto_insert_metric_name=False,
     )
+
     callbacks.append(checkpoint)
 
     if config["training"]["early_stop"]:
         print_only("Instantiating EarlyStopping")
-        callbacks.append(EarlyStopping(**config["training"]["early_stop"]))
-    # callbacks.append(MyRichProgressBar(theme=RichProgressBarTheme()))
 
-    # Don't ask GPU if they are not available.
-    gpus = config["training"]["gpus"] if torch.cuda.is_available() else None
-    distributed_backend = "gpu" if torch.cuda.is_available() else None
+        callbacks.append(
+            EarlyStopping(
+                **config["training"]["early_stop"]
+            )
+        )
 
-    # default logger used by trainer
-    logger_dir = os.path.join(os.getcwd(), "Experiments", "tensorboard_logs")
-    os.makedirs(os.path.join(logger_dir, config["exp"]["exp_name"]), exist_ok=True)
-    comet_logger = WandbLogger(
-            name=config["exp"]["exp_name"], 
-            save_dir=os.path.join(logger_dir, config["exp"]["exp_name"]), 
-            project="RTFSNet",
+    # callbacks.append(
+    #     MyRichProgressBar(
+    #         theme=RichProgressBarTheme()
+    #     )
+    # )
+
+    # ------------------------------------------------------------------
+    # Hardware
+    # ------------------------------------------------------------------
+    gpus = (
+        config["training"]["gpus"]
+        if torch.cuda.is_available()
+        else 1
     )
 
+    distributed_backend = (
+        "gpu"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    # ------------------------------------------------------------------
+    # W&B
+    # ------------------------------------------------------------------
+    wandb_logger = build_wandb_logger(
+        experiment_name=experiment_name,
+        logger_dir=wandb_dir,
+        config=config,
+        wandb_run_id=wandb_run_id,
+    )
+
+    # ------------------------------------------------------------------
+    # Trainer
+    # ------------------------------------------------------------------
     trainer = pl.Trainer(
         max_epochs=config["training"]["epochs"],
         callbacks=callbacks,
         default_root_dir=exp_dir,
         devices=gpus,
         accelerator=distributed_backend,
-        strategy=DDPStrategy(find_unused_parameters=True),
-        limit_train_batches=1.0,  # Useful for fast experiment
+        strategy=DDPStrategy(
+            find_unused_parameters=True
+        ),
+        limit_train_batches=1.0,
         gradient_clip_val=5.0,
-        logger=comet_logger,
+        logger=wandb_logger,
         sync_batchnorm=True,
         num_sanity_val_steps=0,
-        # fast_dev_run=True,
-    )
-    trainer.fit(system, ckpt_path="/home/data2/Experiments/checkpoint/SwiftNet/epoch=170.ckpt")
-    print_only("Finished Training")
-    best_k = {k: v.item() for k, v in checkpoint.best_k_models.items()}
-    with open(os.path.join(exp_dir, "best_k_models.json"), "w") as f:
-        json.dump(best_k, f, indent=0)
 
-    state_dict = torch.load(checkpoint.best_model_path)
-    system.load_state_dict(state_dict=state_dict["state_dict"])
+        # Must match the original training to preserve the same
+        # effective batch size and update frequency.
+        accumulate_grad_batches=config["training"][
+            "accumulate_grad_batches"
+        ],
+
+        # Can be changed when resuming, but training will then use
+        # a different numerical regime.
+        precision=precision,
+    )
+
+    # Restores:
+    # - model state;
+    # - optimizer state;
+    # - scheduler state;
+    # - epoch/global step;
+    # - EarlyStopping state;
+    # - callback state.
+    trainer.fit(
+        system,
+        ckpt_path=checkpoint_path,
+    )
+
+    print_only("Finished Training")
+
+    # ------------------------------------------------------------------
+    # Save information about the best checkpoints
+    # ------------------------------------------------------------------
+    best_k = {
+        path: score.item()
+        for path, score in checkpoint.best_k_models.items()
+    }
+
+    with open(
+        os.path.join(exp_dir, "best_k_models.json"),
+        "w",
+    ) as file:
+        json.dump(
+            best_k,
+            file,
+            indent=2,
+        )
+
+    if not checkpoint.best_model_path:
+        raise RuntimeError(
+            "No best checkpoint available after resuming. "
+            "Check the ModelCheckpoint monitor."
+        )
+
+    # ------------------------------------------------------------------
+    # Export the best model
+    # ------------------------------------------------------------------
+    state_dict = torch.load(
+        checkpoint.best_model_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    system.load_state_dict(
+        state_dict=state_dict["state_dict"]
+    )
+
     system.cpu()
 
     to_save = system.audio_model.serialize()
-    torch.save(to_save, os.path.join(exp_dir, "best_model.pth"))
+
+    torch.save(
+        to_save,
+        os.path.join(exp_dir, "best_model.pth"),
+    )
 
 
 if __name__ == "__main__":
     import yaml
-    # from pprint_only import pprint_only
+
     from look2hear.utils.parser_utils import (
         prepare_parser_from_dict,
         parse_args_as_dict,
     )
 
-    args = parser.parse_args()
-    with open(args.conf_dir) as f:
-        def_conf = yaml.safe_load(f)
-    parser = prepare_parser_from_dict(def_conf, parser=parser)
+    preliminary_args, _ = parser.parse_known_args()
 
-    arg_dic, plain_args = parse_args_as_dict(parser, return_plain_args=True)
-    # pprint_only(arg_dic)
-    main(arg_dic)
+    with open(preliminary_args.conf_dir) as file:
+        def_conf = yaml.safe_load(file)
+
+    parser = prepare_parser_from_dict(
+        def_conf,
+        parser=parser,
+    )
+
+    arg_dic, plain_args = parse_args_as_dict(
+        parser,
+        return_plain_args=True,
+    )
+
+    main(
+        config=arg_dic,
+        checkpoint_path=plain_args.ckpt_path,
+        precision=plain_args.precision,
+        tf32_enabled=plain_args.tf32,
+        torch_compile_enabled=plain_args.torch_compile,
+        compile_mode=plain_args.compile_mode,
+        wandb_run_id=plain_args.wandb_run_id,
+    )
