@@ -1,0 +1,117 @@
+absl-py
+addict
+aiohappyeyeballs
+aiohttp
+aiosignal
+annotated-types
+attrs
+audioread
+black
+blessed
+cachetools
+cffi
+click
+contourpy
+cycler
+decorator
+docker-pycreds
+einops
+face-alignment
+facenet-pytorch
+fonttools
+frozenlist
+fsspec
+gitdb
+gitpython
+google-auth
+google-auth-oauthlib
+gpustat
+grpcio
+huggingface-hub
+imageio
+joblib
+kiwisolver
+lazy-loader
+lightning-utilities
+llvmlite
+markdown-it-py
+matplotlib
+mdurl
+# mmcv
+mmengine
+msgpack
+multidict
+mypy-extensions
+ninja.4
+numba
+numpy
+# nvidia-cublas-cu12.1
+# nvidia-cuda-cupti-cu12
+# nvidia-cuda-nvrtc-cu12
+# nvidia-cuda-runtime-cu12
+# nvidia-cudnn-cu12.26
+# nvidia-cufft-cu12.54
+# nvidia-curand-cu12.106
+# nvidia-cusolver-cu12.107
+# nvidia-cusparse-cu12.106
+# nvidia-ml-py
+# nvidia-nccl-cu12
+# nvidia-nvjitlink-cu12
+# nvidia-nvtx-cu12
+oauthlib
+opencv-python.80
+packaging
+pathspec
+pillow
+platformdirs
+pooch
+propcache
+protobuf
+psutil
+ptflops
+pyasn1
+pyasn1-modules
+pycparser
+pydantic-core
+pygments
+pyparsing
+pypesq
+pystoi
+python-dateutil.post0
+pytorch-lightning
+pytorch-ranger
+pytz-oauthlib
+rich
+rsa
+scikit-image
+scikit-learn
+scipy
+sentry-sdk
+setproctitle
+sigfig
+six
+smmap
+sortedcontainers
+soundfile
+soxr.post1
+sru
+sympy
+tensorboard
+tensorboard-data-server
+termcolor
+thop-2209072238
+threadpoolctl
+tifffile
+timm
+torch
+torch-optimizer
+torchaudio
+torchmetrics
+torchvision
+tqdm
+triton
+tzdata
+wcwidth
+werkzeug
+yapf
+yarl

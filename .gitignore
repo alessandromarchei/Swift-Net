@@ -1,2 +1,14 @@
 *.pyc
 DataPreProcess/Vox2
+DataPreProcess/LRS2
+DataPreProcess/LRS3
+configs/
+
+__pycache__/
+
+Experiments/
+Models/
+video/
+
+*.png
+pretrain_zoo/

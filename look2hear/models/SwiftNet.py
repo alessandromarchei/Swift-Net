@@ -686,6 +686,7 @@ class FTGS(nn.Module):
 
         self.pool = F.adaptive_avg_pool2d if self.is2d else F.adaptive_avg_pool1d
 
+        #1x1 DW convolution for channel-wise gating (dw because groups=in_chan)
         self.gateway = ConvNormAct(
             in_chan=self.in_chan,
             out_chan=self.in_chan,
@@ -695,6 +696,8 @@ class FTGS(nn.Module):
             is2d=self.is2d,
             causal=False,  
         )
+
+        #1x1 conv2d for channel projection
         self.projection = ConvNormAct(
             in_chan=self.in_chan,
             out_chan=self.hid_chan,

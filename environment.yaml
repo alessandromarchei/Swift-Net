@@ -1,4 +1,4 @@
-name: sru
+name: swiftnet2
 channels:
   - pytorch
   - nvidia
@@ -271,4 +271,4 @@ dependencies:
       - werkzeug==3.1.3
       - yapf==0.43.0
       - yarl==1.18.3
-prefix: /home/data1/anaconda3/envs/sru
+prefix: /home/data1/anaconda3/envs/swiftnet2

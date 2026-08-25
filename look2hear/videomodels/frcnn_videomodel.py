@@ -93,10 +93,13 @@ class FRCNNVideoModel(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
+
         if mode:  # freeze BN stats
-            for m in self.modules():
-                if isinstance(m, _BatchNorm):
-                    m.eval()
+            for module in self.modules():
+                if isinstance(module, _BatchNorm):
+                    module.eval()
+
+        return self
 
 
 def check_parameters(net):

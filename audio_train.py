@@ -19,7 +19,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, RichProgressBar
 from pytorch_lightning.callbacks.progress.rich_progress import *
 from rich.console import Console
-from swanlab.integration.pytorch_lightning import SwanLabLogger
+from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies.ddp import DDPStrategy
 from rich import print, reconfigure
 from collections.abc import MutableMapping
@@ -135,14 +135,23 @@ def main(config):
     gpus = config["training"]["gpus"] if torch.cuda.is_available() else None
     distributed_backend = "gpu" if torch.cuda.is_available() else None
 
-    # default logger used by trainer
-    logger_dir = os.path.join(os.getcwd(), "Experiments", "tensorboard_logs")
-    os.makedirs(os.path.join(logger_dir, config["exp"]["exp_name"]), exist_ok=True)
-    comet_logger = SwanLabLogger(
-            name=config["exp"]["exp_name"], 
-            save_dir=os.path.join(logger_dir, config["exp"]["exp_name"]), 
-            project="RTFSNet",
+    # W&B logger
+    logger_dir = os.path.join(
+        os.getcwd(),
+        "Experiments",
+        "wandb_logs",
     )
+    os.makedirs(logger_dir, exist_ok=True)
+
+    wandb_logger = WandbLogger(
+        name=config["exp"]["exp_name"],
+        project="SwiftNet",
+        save_dir=logger_dir,
+        log_model=False,
+    )
+
+    # Salva anche tutta la configurazione YAML nella run
+    wandb_logger.log_hyperparams(config)
 
     trainer = pl.Trainer(
         max_epochs=config["training"]["epochs"],
@@ -151,13 +160,15 @@ def main(config):
         devices=gpus,
         accelerator=distributed_backend,
         strategy=DDPStrategy(find_unused_parameters=True),
-        limit_train_batches=1.0,  # Useful for fast experiment
+        limit_train_batches=1.0,
         gradient_clip_val=5.0,
-        logger=comet_logger,
+        logger=wandb_logger,
         sync_batchnorm=True,
         num_sanity_val_steps=0,
-        # fast_dev_run=True,
+        accumulate_grad_batches=config["training"]["accumulate_grad_batches"],
     )
+    
+
     trainer.fit(system)
     print_only("Finished Training")
     best_k = {k: v.item() for k, v in checkpoint.best_k_models.items()}
