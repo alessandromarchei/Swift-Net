@@ -4,20 +4,13 @@ from pytorch_lightning.utilities import rank_zero_only
 from typing import Union
 from pytorch_lightning.callbacks.progress.rich_progress import *
 from rich.console import Console, RenderableType
-from rich.progress_bar import ProgressBar
 from rich.style import Style
 from rich.text import Text
 from rich.progress import (
-    BarColumn,
-    DownloadColumn,
-    Progress,
-    TaskID,
-    TextColumn,
-    TimeRemainingColumn,
-    TransferSpeedColumn,
     ProgressColumn
 )
 from rich import print, reconfigure
+import torch
 
 @rank_zero_only
 def print_only(message: str):
@@ -102,3 +95,29 @@ class MyRichProgressBar(RichProgressBar):
             self.progress.start()
             # progress has started
             self._progress_stopped = False
+
+
+def tensors_to_device(tensors, device):
+    """Transfer tensor, dict or list of tensors to device.
+
+    Args:
+        tensors (:class:`torch.Tensor`): May be a single, a list or a
+            dictionary of tensors.
+        device (:class: `torch.device`): the device where to place the tensors.
+
+    Returns:
+        Union [:class:`torch.Tensor`, list, tuple, dict]:
+            Same as input but transferred to device.
+            Goes through lists and dicts and transfers the torch.Tensor to
+            device. Leaves the rest untouched.
+    """
+    if isinstance(tensors, torch.Tensor):
+        return tensors.to(device)
+    elif isinstance(tensors, (list, tuple)):
+        return [tensors_to_device(tens, device) for tens in tensors]
+    elif isinstance(tensors, dict):
+        for key in tensors.keys():
+            tensors[key] = tensors_to_device(tensors[key], device)
+        return tensors
+    else:
+        return tensors

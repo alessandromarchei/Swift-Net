@@ -2,36 +2,24 @@ import os
 import sys
 import re
 import torch
-from torch import Tensor
 import argparse
 import json
 import look2hear.datas
 import look2hear.models
 import look2hear.system
 import look2hear.losses
-import look2hear.metrics
-import look2hear.utils
 import look2hear.videomodels
 from look2hear.system import make_optimizer
-from dataclasses import dataclass
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     EarlyStopping,
-    RichProgressBar,
 )
 from pytorch_lightning.callbacks.progress.rich_progress import *
-from rich.console import Console
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies.ddp import DDPStrategy
-from rich import print, reconfigure
-from collections.abc import MutableMapping
 from look2hear.utils import (
     print_only,
-    MyRichProgressBar,
-    RichProgressBarTheme,
 )
 
 import warnings

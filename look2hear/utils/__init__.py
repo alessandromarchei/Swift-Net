@@ -7,8 +7,14 @@ from .parser_utils import (
     isfloat,
     isint,
 )
-from .lightning_utils import print_only, RichProgressBarTheme, MyRichProgressBar, BatchesProcessedColumn, MyMetricsTextColumn
-
+from .lightning_utils import (
+    print_only,
+    tensors_to_device,
+    RichProgressBarTheme,
+    MyRichProgressBar,
+    BatchesProcessedColumn,
+    MyMetricsTextColumn,
+)
 __all__ = [
     "STFT",
     "pad_x_to_y",

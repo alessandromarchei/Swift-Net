@@ -2,36 +2,24 @@ import os
 import sys
 import re
 import torch
-from torch import Tensor
 import argparse
 import json
 import look2hear.datas
 import look2hear.models
 import look2hear.system
 import look2hear.losses
-import look2hear.metrics
-import look2hear.utils
 import look2hear.videomodels
 from look2hear.system import make_optimizer
-from dataclasses import dataclass
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     EarlyStopping,
-    RichProgressBar,
 )
 from pytorch_lightning.callbacks.progress.rich_progress import *
-from rich.console import Console
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies.ddp import DDPStrategy
-from rich import print, reconfigure
-from collections.abc import MutableMapping
 from look2hear.utils import (
     print_only,
-    MyRichProgressBar,
-    RichProgressBarTheme,
 )
 
 import warnings
@@ -420,7 +408,7 @@ def main(
         )
     )
 
-    system = getattr(
+    base_system = getattr(
         look2hear.system,
         config["training"]["system"],
     )(
@@ -434,6 +422,11 @@ def main(
         scheduler=scheduler,
         config=config,
     )
+
+    # Per default il Trainer usa il normale LightningModule.
+    # Se torch.compile è abilitato, questa variabile conterrà
+    # invece il wrapper compilato.
+    train_system = base_system
 
     # ------------------------------------------------------------------
     # Torch compile
@@ -450,8 +443,8 @@ def main(
 
         torch._dynamo.config.suppress_errors = True
 
-        system = torch.compile(
-            system,
+        train_system = torch.compile(
+            base_system,
             mode=compile_mode,
             fullgraph=False,
         )
@@ -555,58 +548,93 @@ def main(
     # - EarlyStopping state;
     # - callback state.
     trainer.fit(
-        system,
+        train_system,
         ckpt_path=checkpoint_path,
     )
 
     print_only("Finished Training")
 
-    # ------------------------------------------------------------------
-    # Save information about the best checkpoints
-    # ------------------------------------------------------------------
-    best_k = {
-        path: score.item()
-        for path, score in checkpoint.best_k_models.items()
-    }
 
-    with open(
-        os.path.join(exp_dir, "best_k_models.json"),
-        "w",
-    ) as file:
-        json.dump(
-            best_k,
-            file,
-            indent=2,
+    print_only("Finished Training")
+
+    # ------------------------------------------------------------------
+    # Save information and export the best checkpoint
+    # ------------------------------------------------------------------
+    if trainer.is_global_zero:
+        best_k = {
+            path: (
+                score.detach().cpu().item()
+                if isinstance(score, torch.Tensor)
+                else float(score)
+            )
+            for path, score in checkpoint.best_k_models.items()
+        }
+
+        best_k_path = os.path.join(
+            exp_dir,
+            "best_k_models.json",
         )
 
-    if not checkpoint.best_model_path:
-        raise RuntimeError(
-            "No best checkpoint available after resuming. "
-            "Check the ModelCheckpoint monitor."
+        with open(best_k_path, "w") as file:
+            json.dump(
+                best_k,
+                file,
+                indent=2,
+            )
+
+        best_checkpoint_path = checkpoint.best_model_path
+
+        if not best_checkpoint_path:
+            raise RuntimeError(
+                "No best checkpoint available after training. "
+                "Check the ModelCheckpoint monitor and validation metrics."
+            )
+
+        print_only(
+            f"Loading best checkpoint: {best_checkpoint_path}"
         )
 
-    # ------------------------------------------------------------------
-    # Export the best model
-    # ------------------------------------------------------------------
-    state_dict = torch.load(
-        checkpoint.best_model_path,
-        map_location="cpu",
-        weights_only=False,
-    )
+        checkpoint_data = torch.load(
+            best_checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
 
-    system.load_state_dict(
-        state_dict=state_dict["state_dict"]
-    )
+        if "state_dict" not in checkpoint_data:
+            raise RuntimeError(
+                f"The checkpoint does not contain 'state_dict': "
+                f"{best_checkpoint_path}"
+            )
 
-    system.cpu()
+        # Load into the original, non-compiled LightningModule.
+        # Lightning checkpoints contain keys such as:
+        # audio_model.encoder...
+        #
+        # The torch.compile wrapper would instead expect:
+        # _orig_mod.audio_model.encoder...
+        base_system.load_state_dict(
+            checkpoint_data["state_dict"],
+            strict=True,
+        )
 
-    to_save = system.audio_model.serialize()
+        base_system.cpu()
+        base_system.eval()
 
-    torch.save(
-        to_save,
-        os.path.join(exp_dir, "best_model.pth"),
-    )
+        output_model_path = os.path.join(
+            exp_dir,
+            "best_model.pth",
+        )
 
+        serialized_audio_model = base_system.audio_model.serialize()
+
+        torch.save(
+            serialized_audio_model,
+            output_model_path,
+        )
+
+        print_only(
+            f"Best model exported to: {output_model_path}"
+        )
 
 if __name__ == "__main__":
     import yaml
