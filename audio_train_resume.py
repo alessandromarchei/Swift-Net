@@ -554,9 +554,6 @@ def main(
 
     print_only("Finished Training")
 
-
-    print_only("Finished Training")
-
     # ------------------------------------------------------------------
     # Save information and export the best checkpoint
     # ------------------------------------------------------------------

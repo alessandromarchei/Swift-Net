@@ -385,7 +385,7 @@ def main(
         )
     )
 
-    system = getattr(
+    base_system = getattr(
         look2hear.system,
         config["training"]["system"],
     )(
@@ -399,6 +399,11 @@ def main(
         scheduler=scheduler,
         config=config,
     )
+
+    # Per default il Trainer usa il normale LightningModule.
+    # Se torch.compile è abilitato, questa variabile conterrà
+    # invece il wrapper compilato.
+    train_system = base_system
 
     # ------------------------------------------------------------------
     # Torch compile
@@ -415,8 +420,8 @@ def main(
 
         torch._dynamo.config.suppress_errors = True
 
-        system = torch.compile(
-            system,
+        train_system = torch.compile(
+            base_system,
             mode=compile_mode,
             fullgraph=False,
         )
@@ -511,56 +516,98 @@ def main(
         precision=precision,
     )
 
-    trainer.fit(system)
+    
+    # Restores:
+    # - model state;
+    # - optimizer state;
+    # - scheduler state;
+    # - epoch/global step;
+    # - EarlyStopping state;
+    # - callback state.
+    trainer.fit(
+        train_system)
+
 
     print_only("Finished Training")
 
     # ------------------------------------------------------------------
-    # Save best checkpoints information
+    # Save information and export the best checkpoint
     # ------------------------------------------------------------------
-    best_k = {
-        path: score.item()
-        for path, score in checkpoint.best_k_models.items()
-    }
+    if trainer.is_global_zero:
+        best_k = {
+            path: (
+                score.detach().cpu().item()
+                if isinstance(score, torch.Tensor)
+                else float(score)
+            )
+            for path, score in checkpoint.best_k_models.items()
+        }
 
-    with open(
-        os.path.join(exp_dir, "best_k_models.json"),
-        "w",
-    ) as file:
-        json.dump(
-            best_k,
-            file,
-            indent=2,
+        best_k_path = os.path.join(
+            exp_dir,
+            "best_k_models.json",
         )
 
-    if not checkpoint.best_model_path:
-        raise RuntimeError(
-            "No best checkpoint available. "
-            "Check the ModelCheckpoint monitor."
+        with open(best_k_path, "w") as file:
+            json.dump(
+                best_k,
+                file,
+                indent=2,
+            )
+
+        best_checkpoint_path = checkpoint.best_model_path
+
+        if not best_checkpoint_path:
+            raise RuntimeError(
+                "No best checkpoint available after training. "
+                "Check the ModelCheckpoint monitor and validation metrics."
+            )
+
+        print_only(
+            f"Loading best checkpoint: {best_checkpoint_path}"
         )
 
-    # ------------------------------------------------------------------
-    # Export best model
-    # ------------------------------------------------------------------
-    state_dict = torch.load(
-        checkpoint.best_model_path,
-        map_location="cpu",
-        weights_only=False,
-    )
+        checkpoint_data = torch.load(
+            best_checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )
 
-    system.load_state_dict(
-        state_dict=state_dict["state_dict"]
-    )
+        if "state_dict" not in checkpoint_data:
+            raise RuntimeError(
+                f"The checkpoint does not contain 'state_dict': "
+                f"{best_checkpoint_path}"
+            )
 
-    system.cpu()
+        # Load into the original, non-compiled LightningModule.
+        # Lightning checkpoints contain keys such as:
+        # audio_model.encoder...
+        #
+        # The torch.compile wrapper would instead expect:
+        # _orig_mod.audio_model.encoder...
+        base_system.load_state_dict(
+            checkpoint_data["state_dict"],
+            strict=True,
+        )
 
-    to_save = system.audio_model.serialize()
+        base_system.cpu()
+        base_system.eval()
 
-    torch.save(
-        to_save,
-        os.path.join(exp_dir, "best_model.pth"),
-    )
+        output_model_path = os.path.join(
+            exp_dir,
+            "best_model.pth",
+        )
 
+        serialized_audio_model = base_system.audio_model.serialize()
+
+        torch.save(
+            serialized_audio_model,
+            output_model_path,
+        )
+
+        print_only(
+            f"Best model exported to: {output_model_path}"
+        )
 
 if __name__ == "__main__":
     import yaml
