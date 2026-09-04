@@ -11,4 +11,4 @@ Models/
 video/
 
 *.png
-pretrain_zoo/
+#pretrain_zoo/
