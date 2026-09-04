@@ -2,7 +2,7 @@
 DataPreProcess/Vox2
 DataPreProcess/LRS2
 DataPreProcess/LRS3
-configs/
+#configs/
 
 __pycache__/
 
