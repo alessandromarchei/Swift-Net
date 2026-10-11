@@ -6,6 +6,7 @@ from sru import SRU
 from .base_model import BaseModel
 from timm.models.layers import DropPath
 from ..layers import normalizations, activations
+from .frequency_mixer import build_frequency_module, parse_frequency_mixer_config
 
 class ConvNormAct(nn.Module):
     def __init__(
@@ -671,6 +672,7 @@ class FTGS(nn.Module):
         layers: dict = dict(),
         is2d: bool = False,
         causal: bool = False,
+        frequency_mixer: dict = None,
     ):
         super(FTGS, self).__init__()
         self.in_chan = in_chan
@@ -683,6 +685,9 @@ class FTGS(nn.Module):
         self.layers = layers
         self.is2d = is2d
         self.causal = causal  
+        # None (absent in YAML) means the original frequency GRNN
+        self.frequency_mixer_type, _ = parse_frequency_mixer_config(frequency_mixer)
+        self.frequency_mixer_cfg = frequency_mixer
 
         self.pool = F.adaptive_avg_pool2d if self.is2d else F.adaptive_avg_pool1d
 
@@ -723,9 +728,15 @@ class FTGS(nn.Module):
                 )
             )
         # Global process
-        self.process_f = DualPathRNN(
-            in_chan=self.hid_chan,
-            **self.layers["layer_1"]
+        # Frequency modeling: original Bi-GSRU (DualPathRNN) or the optional conv mixer.
+        # Only this module changes; the temporal GRNN and attention are untouched.
+        self.process_f = build_frequency_module(
+            channels=self.hid_chan,
+            freq_cfg=self.frequency_mixer_cfg,
+            grnn_builder=lambda: DualPathRNN(
+                in_chan=self.hid_chan,
+                **self.layers["layer_1"]
+            ),
         )
         self.process_t = DualPathRNN(
             in_chan=self.hid_chan,
@@ -1415,6 +1426,16 @@ class SwiftNet(BaseModel):
 
         return separated_audios
     
+    def architecture_summary(self):
+        """Architecture choices stored in checkpoints (frequency modeling and FTGS repeats)."""
+        freq_cfg = self.audio_params.get("frequency_mixer") or {"type": "grnn"}
+        return {
+            "model": self.__class__.__name__,
+            "frequency_mixer": freq_cfg,
+            "ftgs_repeats": self.separator.fusion_repeats + self.separator.audio_repeats,
+            "ftgs_shared": self.separator.audio_shared,
+        }
+
     def get_model_args(self):
         model_args = {"n_src": 2}
         return model_args

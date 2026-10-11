@@ -21,6 +21,13 @@ from pytorch_lightning.strategies.ddp import DDPStrategy
 from look2hear.utils import (
     print_only,
 )
+from look2hear.utils.checkpoint_utils import (
+    check_architecture,
+    load_audio_weights,
+    migrate_checkpoint,
+    LEGACY_MONITOR,
+    upgrade_legacy_monitor,
+)
 
 import warnings
 
@@ -315,12 +322,24 @@ def main(
         )
     )
 
-    video_model = getattr(
-        look2hear.videomodels,
-        config["videonet"]["videonet_name"],
-    )(
-        **config["videonet"]["videonet_config"],
-    )
+    # The visual mode is decided by the datamodule: with precomputed embeddings
+    # the video backbone is not built at all.
+    visual_mode = "cached" if datamodule.uses_cached_visual else "online"
+
+    video_model = None
+    if visual_mode == "online":
+        video_model = getattr(
+            look2hear.videomodels,
+            config["videonet"]["videonet_name"],
+        )(
+            **config["videonet"]["videonet_config"],
+        )
+    else:
+        print_only(
+            "Visual features are precomputed "
+            f"({config['datamodule']['data_config']['visual_features_path']}): "
+            "FRCNNVideoModel is not instantiated."
+        )
 
     # ------------------------------------------------------------------
     # Optimizer
@@ -421,6 +440,7 @@ def main(
         test_loader=test_loader,
         scheduler=scheduler,
         config=config,
+        visual_mode=visual_mode,
     )
 
     # Per default il Trainer usa il normale LightningModule.
@@ -461,7 +481,7 @@ def main(
     checkpoint = ModelCheckpoint(
         dirpath=checkpoint_dir,
         filename="epoch-{epoch:03d}",
-        monitor="val_loss/dataloader_idx_0",
+        monitor="val_loss",
         mode="min",
         save_top_k=5,
         save_last=True,
@@ -471,6 +491,7 @@ def main(
 
     callbacks.append(checkpoint)
 
+    upgrade_legacy_monitor(config)
     if config["training"]["early_stop"]:
         print_only("Instantiating EarlyStopping")
 
@@ -539,6 +560,42 @@ def main(
         # a different numerical regime.
         precision=precision,
     )
+
+    # Checkpoint compatibility checks. Resuming requires the same architecture.
+    # Checkpoints from before the monitor rename, or from the online visual mode,
+    # are migrated into a copy inside the new experiment directory. The original file is never modified.
+    resume_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    check_architecture(resume_data, model.architecture_summary())
+    ckpt_has_video = any(k.startswith("video_model.") for k in resume_data["state_dict"])
+    if visual_mode == "online" and not ckpt_has_video:
+        raise ValueError(
+            "This checkpoint was trained with precomputed visual features (no video_model weights). "
+            "Resume it with datamodule.data_config.visual_features_path set."
+        )
+    needs_monitor_migration = any(LEGACY_MONITOR in key for key in resume_data.get("callbacks", {}))
+    drop_video = visual_mode == "cached" and ckpt_has_video
+    # Lightning does not carry top-k history across a directory change. Say so explicitly, because
+    # warnings are filtered in this script.
+    previous_dirs = {
+        state.get("dirpath")
+        for key, state in resume_data.get("callbacks", {}).items()
+        if key.startswith("ModelCheckpoint") and state.get("dirpath")
+    }
+    if previous_dirs and previous_dirs != {checkpoint_dir}:
+        print_only(
+            f"Note: top-k checkpoint history of the previous run is not carried over (checkpoint directory "
+            f"changed from {sorted(previous_dirs)} to {checkpoint_dir}). Previous top-k files stay in place and "
+            "are not pruned by this run. Optimizer, scheduler and EarlyStopping states are restored."
+        )
+    del resume_data
+    if needs_monitor_migration or drop_video:
+        migrated_path = os.path.join(exp_dir, "resumed_checkpoint_migrated.ckpt")
+        report = migrate_checkpoint(checkpoint_path, migrated_path, drop_video_model=drop_video)
+        print_only(
+            f"Migrated checkpoint to {migrated_path}: renamed callback states={report['renamed_callback_states']}, "
+            f"dropped video_model tensors={report['dropped_video_keys']}"
+        )
+        checkpoint_path = migrated_path
 
     # Restores:
     # - model state;

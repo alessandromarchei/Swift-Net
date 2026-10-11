@@ -74,6 +74,60 @@ Feel free to explore and fine-tune the configuration files in the `config` direc
 
 Use the `audio_visual_test.py` script for evaluating your trained model on the test set. 
 
+## Visual embedding cache, frequency mixer and testing
+
+Three independent choices are available. Each one is controlled by the YAML config and works without the others.
+
+| Choice | Config key | Values |
+|---|---|---|
+| Visual features | `datamodule.data_config.visual_features_path` | `null` (online FRCNN backbone) or a cache directory |
+| Frequency modeling | `audionet.audionet_config.audio_params.frequency_mixer.type` | `grnn` (original, also the default when absent) or `conv` |
+| FTGS depth/sharing | `audio_params.repeats`, `audio_params.shared` | any value |
+
+**1. Precompute visual embeddings once** (deterministic center-crop preprocessing, FP32 by default):
+```bash
+python scripts/precompute_visual_embeddings.py \
+    --conf_dir configs/lrs2_SwiftNet_6.yml \
+    --output_dir DataPreProcess/LRS2_visual_features \
+    --splits tr cv tt --batch_size 64 --num_workers 8
+# re-run the same command after an interruption: completed entries are skipped
+python scripts/precompute_visual_embeddings.py --conf_dir configs/lrs2_SwiftNet_6.yml \
+    --output_dir DataPreProcess/LRS2_visual_features --verify_only
+```
+Add `--cpu` to run on CPU and `--dtype float16` to halve the storage.
+
+**2. Check the numerical equivalence** of cached and online embeddings and of the separator output:
+```bash
+python scripts/validate_visual_cache.py --conf_dir configs/lrs2_SwiftNet_6.yml \
+    --cache_dir DataPreProcess/LRS2_visual_features --split cv --num_samples 64 \
+    --ckpt Experiments/LRS2_SwiftNet_6/checkpoints/last.ckpt --device cuda
+```
+
+**3. Train** (`configs/lrs2_SwiftNet_6_cached.yml` is the original SwiftNet-6 with cached embeddings):
+```bash
+python audio_train.py --conf_dir configs/lrs2_SwiftNet_6_cached.yml
+python audio_train.py --conf_dir configs/lrs2_SwiftNet_6_freqmix_sum.yml     # conv mixer, sum fusion
+python audio_train.py --conf_dir configs/lrs2_SwiftNet_6_freqmix_concat.yml  # conv mixer, concat fusion
+```
+Resume with `audio_train_resume.py --conf_dir <config> --ckpt_path <checkpoint>`. Initialize from another run with
+`audio_train.py ... --init_ckpt <checkpoint> --init_mode strict|partial` (`partial` loads only matching tensors and reports the rest).
+
+**4. Test** (the only place where the test split is evaluated; training only validates):
+```bash
+python scripts/test_lightning_checkpoint.py --conf_dir configs/lrs2_SwiftNet_6_cached.yml \
+    --ckpt_path Experiments/<exp>/checkpoints/last.ckpt
+```
+
+**Validation metric.** The monitored metric is `val_loss` (it was `val_loss/dataloader_idx_0`). Resuming an older checkpoint
+renames its saved callback state automatically into a copy in the new experiment directory. The original file is not modified.
+
+**Tests and benchmarks**
+```bash
+python -m unittest tests.test_frequency_mixer tests.test_pipeline -v
+python scripts/benchmark_frequency_mixer.py --device cuda --full_model --output results/freq_bench.json
+python scripts/benchmark_training_pipeline.py --device cuda --precision fp32 --output results/train_bench.json
+```
+
 # Contact
 
 If you have any questions, suggestions, or encounter any issues, please don't hesitate to reach out to us. You can contact us via email at `tsinghua.kaili [AT] gmail.com`.

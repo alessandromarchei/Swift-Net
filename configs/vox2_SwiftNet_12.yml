@@ -45,6 +45,8 @@ audionet:
         repeats: 12
         shared: true
         is2d: true
+        frequency_mixer:
+          type: grnn
         layers:
           layer_1:
             hid_chan: 32
@@ -124,7 +126,7 @@ training:
   parallel: ddp
   epochs: 500
   early_stop:
-    monitor: val_loss/dataloader_idx_0
+    monitor: val_loss
     mode: min
     patience: 15
     verbose: true
@@ -157,6 +159,7 @@ datamodule:
     num_workers: 8
     pin_memory: true
     persistent_workers: false
+    visual_features_path: null   # path to precomputed embeddings; null = online video backbone
 
     
 exp:

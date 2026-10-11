@@ -21,6 +21,13 @@ from pytorch_lightning.strategies.ddp import DDPStrategy
 from look2hear.utils import (
     print_only,
 )
+from look2hear.utils.checkpoint_utils import (
+    check_architecture,
+    load_audio_weights,
+    migrate_checkpoint,
+    LEGACY_MONITOR,
+    upgrade_legacy_monitor,
+)
 
 import warnings
 
@@ -64,6 +71,21 @@ parser.add_argument(
     default="default",
     choices=["default", "reduce-overhead", "max-autotune"],
     help="Mode used by torch.compile().",
+)
+
+parser.add_argument(
+    "--init_ckpt",
+    type=str,
+    default=None,
+    help="Lightning checkpoint used to initialize the audio model (not a resume).",
+)
+
+parser.add_argument(
+    "--init_mode",
+    type=str,
+    default="strict",
+    choices=["strict", "partial"],
+    help="strict: all weights must match. partial: load only matching tensors (for architecture changes).",
 )
 
 parser.add_argument(
@@ -143,6 +165,8 @@ def build_wandb_logger(
     logger_dir,
     config,
     wandb_run_id=None,
+    init_ckpt=None,
+    init_mode="strict",
 ):
     """
     Build the W&B logger.
@@ -177,6 +201,8 @@ def main(
     torch_compile_enabled,
     compile_mode,
     wandb_run_id,
+    init_ckpt=None,
+    init_mode="strict",
 ):
     configure_numerical_precision(tf32_enabled)
 
@@ -213,6 +239,8 @@ def main(
     config["runtime"]["torch_compile"] = torch_compile_enabled
     config["runtime"]["compile_mode"] = compile_mode
     config["runtime"]["wandb_run_id"] = wandb_run_id
+    config["runtime"]["init_ckpt"] = init_ckpt
+    config["runtime"]["init_mode"] = init_mode
 
     # ------------------------------------------------------------------
     # DataModule
@@ -252,6 +280,23 @@ def main(
     )
 
     # ------------------------------------------------------------------
+    # Optional initialization from another checkpoint (not a resume).
+    # strict: same architecture required. partial: transfer matching tensors only.
+    # ------------------------------------------------------------------
+    if init_ckpt:
+        init_data = torch.load(init_ckpt, map_location="cpu", weights_only=False)
+        mismatches = check_architecture(
+            init_data, model.architecture_summary(), allow_mismatch=init_mode == "partial"
+        )
+        report = load_audio_weights(model, init_data["state_dict"], mode=init_mode)
+        print_only(
+            f"Initialized audio model from {init_ckpt} (mode={init_mode}): "
+            f"loaded={report['loaded']} skipped={len(report['skipped'])} missing={len(report['missing'])}"
+            + (f" architecture_mismatches={mismatches}" if mismatches else "")
+        )
+        del init_data
+
+    # ------------------------------------------------------------------
     # Video model
     # ------------------------------------------------------------------
     print_only(
@@ -260,12 +305,24 @@ def main(
         )
     )
 
-    video_model = getattr(
-        look2hear.videomodels,
-        config["videonet"]["videonet_name"],
-    )(
-        **config["videonet"]["videonet_config"],
-    )
+    # The visual mode is decided by the datamodule: with precomputed embeddings
+    # the video backbone is not built at all.
+    visual_mode = "cached" if datamodule.uses_cached_visual else "online"
+
+    video_model = None
+    if visual_mode == "online":
+        video_model = getattr(
+            look2hear.videomodels,
+            config["videonet"]["videonet_name"],
+        )(
+            **config["videonet"]["videonet_config"],
+        )
+    else:
+        print_only(
+            "Visual features are precomputed "
+            f"({config['datamodule']['data_config']['visual_features_path']}): "
+            "FRCNNVideoModel is not instantiated."
+        )
 
     # ------------------------------------------------------------------
     # Optimizer
@@ -398,6 +455,7 @@ def main(
         test_loader=test_loader,
         scheduler=scheduler,
         config=config,
+        visual_mode=visual_mode,
     )
 
     # Per default il Trainer usa il normale LightningModule.
@@ -438,7 +496,7 @@ def main(
     checkpoint = ModelCheckpoint(
         dirpath=checkpoint_dir,
         filename="epoch-{epoch:03d}",
-        monitor="val_loss/dataloader_idx_0",
+        monitor="val_loss",
         mode="min",
         save_top_k=5,
         verbose=True,
@@ -448,6 +506,7 @@ def main(
 
     callbacks.append(checkpoint)
 
+    upgrade_legacy_monitor(config)
     if config["training"]["early_stop"]:
         print_only("Instantiating EarlyStopping")
 
@@ -641,4 +700,6 @@ if __name__ == "__main__":
         torch_compile_enabled=plain_args.torch_compile,
         compile_mode=plain_args.compile_mode,
         wandb_run_id=plain_args.wandb_run_id,
+        init_ckpt=plain_args.init_ckpt,
+        init_mode=plain_args.init_mode,
     )

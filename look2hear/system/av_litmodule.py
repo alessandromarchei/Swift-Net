@@ -39,10 +39,21 @@ class AudioVisualLightningModule(pl.LightningModule):
         test_loader=None,
         scheduler=None,
         config=None,
+        visual_mode="online",
     ):
         super().__init__()
+        # "online": mouth frames go through the frozen video_model at every step.
+        # "cached": the batch already contains precomputed embeddings [B, D, T]; video_model must be None.
+        if visual_mode not in ("online", "cached"):
+            raise ValueError(f"visual_mode must be 'online' or 'cached', got {visual_mode!r}")
+        if visual_mode == "cached" and video_model is not None:
+            raise ValueError("visual_mode='cached' must not instantiate the video model")
+        if visual_mode == "online" and video_model is None:
+            raise ValueError("visual_mode='online' requires a video model")
+
         self.audio_model = audio_model
         self.video_model = video_model
+        self.visual_mode = visual_mode
         self.optimizer = optimizer
         self.loss_func = loss_func
         self.train_loader = train_loader
@@ -51,22 +62,26 @@ class AudioVisualLightningModule(pl.LightningModule):
         self.scheduler = scheduler
         self.config = {} if config is None else config
         # Save lightning"s AttributeDict under self.hparams
-        self.default_monitor = "val_loss/dataloader_idx_0"
+        self.default_monitor = "val_loss"
         self.save_hyperparameters(self.config_to_hparams(self.config))
         # self.print(self.audio_model)
-        self.validation_step_outputs = []
-        self.test_step_outputs = []
 
     def forward(self, wav, mouth=None):
         """Applies forward pass of the model.
 
+        In "online" mode ``mouth`` is a mouth crop batch; in "cached" mode it is a batch of
+        precomputed visual embeddings. The mode is an explicit flag, not inferred from the tensor shape.
+
         Returns:
             :class:`torch.Tensor`
         """
-        if mouth.ndim == 4:
-            mouth = mouth.unsqueeze(1)
-        with torch.no_grad():
-            mouth_emb = self.video_model(mouth.type_as(wav))
+        if self.visual_mode == "cached":
+            mouth_emb = mouth.type_as(wav)
+        else:
+            if mouth.ndim == 4:
+                mouth = mouth.unsqueeze(1)
+            with torch.no_grad():
+                mouth_emb = self.video_model(mouth.type_as(wav))
         return self.audio_model(wav, mouth_emb)
 
     def training_step(self, batch, batch_nb):
@@ -89,49 +104,26 @@ class AudioVisualLightningModule(pl.LightningModule):
 
         return {"loss": loss}
 
-    def validation_step(self, batch, batch_nb, dataloader_idx):
-        # cal val loss
-        if dataloader_idx == 0:
-            mixtures, targets, mouth, _ = batch
-            est_sources = self(mixtures, mouth)
-            if targets.ndim == 2:
-                targets = targets.unsqueeze(1)
-            loss = self.loss_func["val"](est_sources, targets)
-            self.log(
-                "val_loss",
-                loss,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,
-                logger=True,
-            )
-            
-            self.validation_step_outputs.append(loss)
-            
-            return {"val_loss": loss}
-
-        # cal test loss
-        if (self.trainer.current_epoch) % 10 == 0 and dataloader_idx == 1:
-            mixtures, targets, mouth, _ = batch
-            est_sources = self(mixtures, mouth)
-            if targets.ndim == 2:
-                targets = targets.unsqueeze(1)
-            tloss = self.loss_func["val"](est_sources, targets)
-            self.log(
-                "test_loss",
-                tloss,
-                on_epoch=True,
-                prog_bar=True,
-                sync_dist=True,
-                logger=True,
-            )
-            self.test_step_outputs.append(tloss)
-            return {"test_loss": tloss}
+    def validation_step(self, batch, batch_nb):
+        # Validation loss only. Test data is never touched here.
+        mixtures, targets, mouth, _ = batch
+        est_sources = self(mixtures, mouth)
+        if targets.ndim == 2:
+            targets = targets.unsqueeze(1)
+        loss = self.loss_func["val"](est_sources, targets)
+        # Lightning averages this over the epoch (sync_dist aggregates across GPUs).
+        self.log(
+            "val_loss",
+            loss,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+            logger=True,
+        )
+        return loss
 
     def on_validation_epoch_end(self):
-        # val
-        avg_loss = torch.stack(self.validation_step_outputs).mean()
-        val_loss = torch.mean(self.all_gather(avg_loss))
+        val_loss = self.trainer.callback_metrics["val_loss"]
         self.log(
             "lr",
             self.optimizer.param_groups[0]["lr"],
@@ -139,6 +131,8 @@ class AudioVisualLightningModule(pl.LightningModule):
             prog_bar=True,
             sync_dist=True,
         )
+        if self.logger is None:
+            return
         self.logger.experiment.log(
             {"learning_rate": self.optimizer.param_groups[0]["lr"], "epoch": self.current_epoch}
         )
@@ -146,15 +140,34 @@ class AudioVisualLightningModule(pl.LightningModule):
             {"val_pit_sisnr": -val_loss, "epoch": self.current_epoch}
         )
 
-        # test
-        if (self.trainer.current_epoch) % 10 == 0:
-            avg_loss = torch.stack(self.test_step_outputs).mean()
-            test_loss = torch.mean(self.all_gather(avg_loss))
-            self.logger.experiment.log(
-                {"test_pit_sisnr": -test_loss, "epoch": self.current_epoch}
-            )
-        self.validation_step_outputs.clear()  # free memory
-        self.test_step_outputs.clear()  # free memory
+    def test_step(self, batch, batch_nb):
+        # Runs only through trainer.test(...), never during trainer.fit(...).
+        mixtures, targets, mouth, _ = batch
+        est_sources = self(mixtures, mouth)
+        if targets.ndim == 2:
+            targets = targets.unsqueeze(1)
+        loss = self.loss_func["val"](est_sources, targets)
+        self.log(
+            "test_loss",
+            loss,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+            logger=True,
+        )
+        return loss
+
+    def on_test_epoch_end(self):
+        if self.logger is None:
+            return
+        test_loss = self.trainer.callback_metrics["test_loss"]
+        self.logger.experiment.log(
+            {"test_pit_sisnr": -test_loss, "epoch": self.current_epoch}
+        )
+
+    def test_dataloader(self):
+        """Test dataloader, used only by trainer.test(...)."""
+        return self.test_loader
 
     def configure_optimizers(self):
         """Initialize optimizers, batch-wise and epoch-wise schedulers."""
@@ -189,11 +202,15 @@ class AudioVisualLightningModule(pl.LightningModule):
 
     def val_dataloader(self):
         """Validation dataloader"""
-        return [self.val_loader, self.test_loader]
+        return self.val_loader
 
     def on_save_checkpoint(self, checkpoint):
         """Overwrite if you want to save more things in the checkpoint."""
         checkpoint["training_config"] = self.config
+        # Records which architecture and visual input produced the weights.
+        checkpoint["visual_mode"] = self.visual_mode
+        if hasattr(self.audio_model, "architecture_summary"):
+            checkpoint["architecture"] = self.audio_model.architecture_summary()
         return checkpoint
 
     @staticmethod

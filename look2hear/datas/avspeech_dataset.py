@@ -11,6 +11,7 @@ import zipfile
 import json
 from typing import Dict, Iterable, List, Iterator
 from .transform import get_preprocessing_pipelines
+from .visual_cache import VisualFeatureCache, normalize_visual_key
 
 
 def normalize_tensor_wav(wav_tensor, eps=1e-8, std=None):
@@ -28,7 +29,8 @@ class AVSpeechDataset(Dataset):
         sample_rate: int = 8000,
         segment: float = 4.0,
         normalize_audio: bool = False,
-        is_train: bool = True
+        is_train: bool = True,
+        visual_cache: VisualFeatureCache = None,
     ):
         super().__init__()
         if json_dir == None:
@@ -38,6 +40,8 @@ class AVSpeechDataset(Dataset):
         self.json_dir = json_dir
         self.sample_rate = sample_rate
         self.normalize_audio = normalize_audio
+        # If set, the dataset returns cached embeddings [D, T] instead of mouth crops.
+        self.visual_cache = visual_cache
         self.lipreading_preprocessing_func = get_preprocessing_pipelines()[
             "train" if is_train else "val"
         ]
@@ -122,6 +126,16 @@ class AVSpeechDataset(Dataset):
     def __len__(self):
         return self.length
 
+    def visual_keys(self):
+        """Identity (mouth .npz path) of every visual source used by this dataset."""
+        keys = []
+        for src in self.sources:
+            if self.n_src == 1:
+                keys.append(normalize_visual_key(src[1]))
+            else:
+                keys.extend(normalize_visual_key(s[1]) for s in src)
+        return sorted(set(keys))
+
     def __getitem__(self, idx: int):
         self.EPS = 1e-8
         if self.n_src == 1:
@@ -137,9 +151,12 @@ class AVSpeechDataset(Dataset):
             source = sf.read(
                 self.sources[idx][0], start=rand_start, stop=stop, dtype="float32"
             )[0]
-            source_mouth = self.lipreading_preprocessing_func(
-                np.load(self.sources[idx][1])["data"]
-            )[:, : self.fps_len]
+            if self.visual_cache is not None:
+                source_mouth = self.visual_cache.get(self.sources[idx][1])  # [D, T] embedding
+            else:
+                source_mouth = self.lipreading_preprocessing_func(
+                    np.load(self.sources[idx][1])["data"]
+                )[:, : self.fps_len]
 
             source = torch.from_numpy(source)
             mixture = torch.from_numpy(mix_source)
@@ -167,14 +184,17 @@ class AVSpeechDataset(Dataset):
                     sf.read(src[0], start=rand_start, stop=stop, dtype="float32")[0]
                 )
             # import pdb; pdb.set_trace()
-            sources_mouths = torch.stack(
-                [
-                    torch.from_numpy(
-                        self.lipreading_preprocessing_func(np.load(src[1])["data"])
-                    )
-                    for src in self.sources[idx]
-                ]
-            )[:, : self.fps_len]
+            if self.visual_cache is not None:
+                sources_mouths = torch.stack([self.visual_cache.get(src[1]) for src in self.sources[idx]])
+            else:
+                sources_mouths = torch.stack(
+                    [
+                        torch.from_numpy(
+                            self.lipreading_preprocessing_func(np.load(src[1])["data"])
+                        )
+                        for src in self.sources[idx]
+                    ]
+                )[:, : self.fps_len]
             # import pdb; pdb.set_trace()
             sources = torch.stack([torch.from_numpy(source) for source in sources])
             mixture = torch.from_numpy(mix_source)
@@ -200,12 +220,15 @@ class AVSpeechDataModule(object):
         num_workers: int = 0,
         pin_memory: bool = False,
         persistent_workers: bool = False,
+        visual_features_path: str = None,
     ) -> None:
         super().__init__()
         if train_dir == None or valid_dir == None or test_dir == None:
             raise ValueError("JSON DIR is None!")
         if n_src not in [1, 2]:
             raise ValueError("{} is not in [1, 2]".format(n_src))
+        # None: online mouth frames + FRCNNVideoModel. Path: precomputed embeddings (see scripts/precompute_visual_embeddings.py).
+        self.visual_features_path = visual_features_path
 
         # this line allows to access init params with 'self.hparams' attribute
         self.train_dir = train_dir
@@ -224,14 +247,20 @@ class AVSpeechDataModule(object):
         self.data_val: Dataset = None
         self.data_test: Dataset = None
 
+    @property
+    def uses_cached_visual(self):
+        return self.visual_features_path is not None
+
     def setup(self) -> None:
+        cache = VisualFeatureCache(self.visual_features_path) if self.uses_cached_visual else None
         self.data_train = AVSpeechDataset(
             json_dir = self.train_dir,
             n_src = self.n_src,
             sample_rate = self.sample_rate,
             segment = self.segment,
             normalize_audio = self.normalize_audio,
-            is_train=True
+            is_train=True,
+            visual_cache=cache,
         )
         self.data_val = AVSpeechDataset(
             json_dir = self.valid_dir,
@@ -239,7 +268,8 @@ class AVSpeechDataModule(object):
             sample_rate = self.sample_rate,
             segment = self.segment,
             normalize_audio = self.normalize_audio,
-            is_train=False
+            is_train=False,
+            visual_cache=cache,
         )
         self.data_test = AVSpeechDataset(
             json_dir = self.test_dir,
@@ -247,8 +277,18 @@ class AVSpeechDataModule(object):
             sample_rate = self.sample_rate,
             segment = self.segment,
             normalize_audio = self.normalize_audio,
-            is_train=False
+            is_train=False,
+            visual_cache=cache,
         )
+        if cache is not None:
+            # Fail before training if the cache does not cover every visual source of every split.
+            for name, dataset in [("train", self.data_train), ("val", self.data_val), ("test", self.data_test)]:
+                missing = cache.missing_keys(dataset.visual_keys())
+                if missing:
+                    raise RuntimeError(
+                        f"Visual cache {self.visual_features_path} misses {len(missing)} entries "
+                        f"of the {name} split (first: {missing[0]}). Run scripts/precompute_visual_embeddings.py."
+                    )
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(

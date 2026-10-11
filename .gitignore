@@ -12,3 +12,6 @@ video/
 
 *.png
 #pretrain_zoo/
+DataPreProcess/*_visual_features/
+results/
+.vscode/
