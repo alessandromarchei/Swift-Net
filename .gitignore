@@ -15,3 +15,6 @@ video/
 DataPreProcess/*_visual_features/
 results/
 .vscode/
+
+
+train_visionpilot*
