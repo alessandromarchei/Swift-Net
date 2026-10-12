@@ -48,8 +48,8 @@ audionet:
         frequency_mixer:
           type: conv
           conv:
-            kernel_sizes: [3, 3, 3]
-            dilations: [1, 2, 4]
+            kernel_sizes: [3, 3, 3, 3]
+            dilations: [1, 2, 4, 8]
             branch_fusion: sum
             hidden_channels: 64
             depthwise: true
@@ -133,7 +133,7 @@ training:
   early_stop:
     monitor: val_loss
     mode: min
-    patience: 15
+    patience: 10
     verbose: true
   
 # Optim config
@@ -146,7 +146,7 @@ optimizer:
 scheduler: 
   sche_name: ReduceLROnPlateau
   sche_config:
-    patience: 10
+    patience: 7
     factor: 0.5
 
 # Data config
@@ -161,11 +161,11 @@ datamodule:
     segment: 2.0
     normalize_audio: false
     batch_size: 4
-    num_workers: 12
+    num_workers: 16
     pin_memory: true
     persistent_workers: false
-    visual_features_path: null   # path to precomputed embeddings; null = online video backbone
+    visual_features_path: /home/ale/work/av-tse/Swift-Net/DataPreProcess/LRS2_visual_features   # path to precomputed embeddings; null = online video backbone
 
     
 exp:
-  exp_name: LRS2_SwiftNet_6_freqmix_sum
+  exp_name: LRS2_SwiftNet_6_freqmix_sum_v2
