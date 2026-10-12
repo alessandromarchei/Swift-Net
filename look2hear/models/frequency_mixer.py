@@ -275,3 +275,26 @@ def build_frequency_module(channels, freq_cfg, grnn_builder):
     if mixer_type == "grnn":
         return grnn_builder()
     return DilatedFrequencyMixer(channels=channels, **conv_cfg)
+
+
+def describe_frequency_module(module):
+    """Return the resolved frequency-module settings as a flat dict, for startup logs and diagnostics.
+
+    Works for both the original GRNN (``DualPathRNN``) and ``DilatedFrequencyMixer``.
+    """
+    info = {"module": type(module).__name__, "params": sum(p.numel() for p in module.parameters())}
+    if not isinstance(module, DilatedFrequencyMixer):
+        return info
+    block = module.blocks[0]
+    info.update(
+        {
+            "branch_fusion": module.branch_fusion,
+            "num_blocks": module.num_blocks,
+            "num_branches": len(block.branches),
+            "kernel_sizes": list(module.kernel_sizes),
+            "dilations": list(module.dilations),
+            "hidden_channels": block.expand.out_channels if isinstance(block.expand, nn.Conv2d) else module.channels,
+            "has_fuse_conv": isinstance(block.fuse, nn.Conv2d),
+        }
+    )
+    return info

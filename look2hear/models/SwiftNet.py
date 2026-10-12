@@ -877,10 +877,11 @@ class LightVid(nn.Module):
     def forward(self, x: torch.Tensor):
         # x: B, C, T, (F)
         residual = self.gateway(x)
-        x_enc = self.projection(residual)
-        x_enc = x_enc.transpose(1, 2).contiguous()
+        x_enc = self.projection(residual)  # B, C, T
+        # SRU expects (length, batch, input): the recurrence must run over T, not over the batch.
+        x_enc = x_enc.permute(2, 0, 1).contiguous()  # T, B, C
         x_rnn, _ = self.rnn(x_enc)
-        x_rnn = x_rnn.transpose(1, 2).contiguous()
+        x_rnn = x_rnn.permute(1, 2, 0).contiguous()  # B, C, T
 
         out = self.residual_conv(x_rnn) + residual
         

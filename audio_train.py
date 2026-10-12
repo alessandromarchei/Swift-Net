@@ -2,6 +2,7 @@ import os
 import sys
 import re
 import torch
+import torch.nn as nn
 import argparse
 import json
 import look2hear.datas
@@ -10,6 +11,7 @@ import look2hear.system
 import look2hear.losses
 import look2hear.videomodels
 from look2hear.system import make_optimizer
+from look2hear.models.frequency_mixer import describe_frequency_module
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
@@ -277,6 +279,16 @@ def main(
     )(
         sample_rate=config["datamodule"]["data_config"]["sample_rate"],
         **config["audionet"]["audionet_config"],
+    )
+
+    # Log the frequency module that is actually instantiated in FTGS (not just the YAML).
+    audio_net = model.separator.audio_net
+    first_ftgs = audio_net[0] if isinstance(audio_net, nn.ModuleList) else audio_net
+    freq_info = describe_frequency_module(first_ftgs.process_f)
+    print_only(f"Frequency module (resolved): {freq_info}")
+    print_only(
+        f"FTGS repeats={model.separator.fusion_repeats + model.separator.audio_repeats} "
+        f"shared={model.separator.audio_shared}"
     )
 
     # ------------------------------------------------------------------
