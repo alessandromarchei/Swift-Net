@@ -8,8 +8,12 @@ import random as random
 import os
 import shutil
 import zipfile
+import io
 import json
 from typing import Dict, Iterable, List, Iterator
+
+import lmdb
+
 from .transform import get_preprocessing_pipelines
 from .visual_cache import VisualFeatureCache, normalize_visual_key
 
@@ -31,6 +35,7 @@ class AVSpeechDataset(Dataset):
         normalize_audio: bool = False,
         is_train: bool = True,
         visual_cache: VisualFeatureCache = None,
+        lmdb_path: str = None,
     ):
         super().__init__()
         if json_dir == None:
@@ -42,6 +47,11 @@ class AVSpeechDataset(Dataset):
         self.normalize_audio = normalize_audio
         # If set, the dataset returns cached embeddings [D, T] instead of mouth crops.
         self.visual_cache = visual_cache
+        # If set, audio and mouths are read from this LMDB instead of the paths in the JSON files.
+        self.lmdb_path = str(lmdb_path) if lmdb_path else None
+        self._lmdb_env = None
+        if self.lmdb_path is not None and not os.path.isdir(self.lmdb_path):
+            raise FileNotFoundError(f"LMDB directory not found: {self.lmdb_path}")
         self.lipreading_preprocessing_func = get_preprocessing_pipelines()[
             "train" if is_train else "val"
         ]
@@ -65,6 +75,15 @@ class AVSpeechDataset(Dataset):
         for src_json in sources_json:
             with open(src_json, "r") as f:
                 sources_infos.append(json.load(f))
+
+        # JSON entries written for LMDB use virtual "/lmdb/<split>/..." paths; they cannot be read from disk.
+        if self.lmdb_path is None and any(
+            str(entry[0]).startswith("/lmdb/") for entry in mix_infos
+        ):
+            raise ValueError(
+                f"{json_dir} indexes LMDB entries (/lmdb/...), but no LMDB path was given. "
+                "Set train_lmdb / valid_lmdb / test_lmdb in the datamodule config."
+            )
 
         self.mix = []
         self.sources = []
@@ -126,6 +145,41 @@ class AVSpeechDataset(Dataset):
     def __len__(self):
         return self.length
 
+    def _lmdb_get(self, key: str) -> bytes:
+        if self._lmdb_env is None:
+            # Opened lazily so each DataLoader worker creates its own environment.
+            self._lmdb_env = lmdb.open(
+                self.lmdb_path,
+                readonly=True,
+                lock=False,
+                readahead=False,
+                meminit=False,
+                max_readers=256,
+                subdir=True,
+            )
+        with self._lmdb_env.begin(write=False) as txn:
+            value = txn.get(key.encode("utf-8"))
+        if value is None:
+            raise KeyError(f"LMDB key not found: {key} (database={self.lmdb_path})")
+        return value
+
+    def _read_audio(self, path, start=0, stop=None):
+        """Read a wav listed in the JSON index, from LMDB (audio/<kind>/<name>) or from disk."""
+        if self.lmdb_path is None:
+            return sf.read(path, start=start, stop=stop, dtype="float32")[0]
+        kind = os.path.basename(os.path.dirname(path))
+        key = f"audio/{kind}/{os.path.basename(path)}"
+        audio, _ = sf.read(io.BytesIO(self._lmdb_get(key)), start=start, stop=stop, dtype="float32")
+        return audio
+
+    def _read_mouth(self, path):
+        """Raw mouth array (the 'data' field of the .npz), from LMDB (mouth/<name>.npz) or from disk."""
+        if self.lmdb_path is None:
+            return np.load(path)["data"]
+        key = f"mouth/{os.path.basename(path)}"
+        with np.load(io.BytesIO(self._lmdb_get(key))) as npz:
+            return npz["data"]
+
     def visual_keys(self):
         """Identity (mouth .npz path) of every visual source used by this dataset."""
         keys = []
@@ -145,17 +199,13 @@ class AVSpeechDataset(Dataset):
             else:
                 stop = rand_start + self.seg_len
 
-            mix_source, _ = sf.read(
-                self.mix[idx][0], start=rand_start, stop=stop, dtype="float32"
-            )
-            source = sf.read(
-                self.sources[idx][0], start=rand_start, stop=stop, dtype="float32"
-            )[0]
+            mix_source = self._read_audio(self.mix[idx][0], rand_start, stop)
+            source = self._read_audio(self.sources[idx][0], rand_start, stop)
             if self.visual_cache is not None:
                 source_mouth = self.visual_cache.get(self.sources[idx][1])  # [D, T] embedding
             else:
                 source_mouth = self.lipreading_preprocessing_func(
-                    np.load(self.sources[idx][1])["data"]
+                    self._read_mouth(self.sources[idx][1])
                 )[:, : self.fps_len]
 
             source = torch.from_numpy(source)
@@ -174,15 +224,11 @@ class AVSpeechDataset(Dataset):
             else:
                 stop = rand_start + self.seg_len
 
-            mix_source, _ = sf.read(
-                self.mix[idx][0], start=rand_start, stop=stop, dtype="float32"
-            )
+            mix_source = self._read_audio(self.mix[idx][0], rand_start, stop)
             sources = []
             for src in self.sources[idx]:
                 # import pdb; pdb.set_trace()
-                sources.append(
-                    sf.read(src[0], start=rand_start, stop=stop, dtype="float32")[0]
-                )
+                sources.append(self._read_audio(src[0], rand_start, stop))
             # import pdb; pdb.set_trace()
             if self.visual_cache is not None:
                 sources_mouths = torch.stack([self.visual_cache.get(src[1]) for src in self.sources[idx]])
@@ -190,7 +236,7 @@ class AVSpeechDataset(Dataset):
                 sources_mouths = torch.stack(
                     [
                         torch.from_numpy(
-                            self.lipreading_preprocessing_func(np.load(src[1])["data"])
+                            self.lipreading_preprocessing_func(self._read_mouth(src[1]))
                         )
                         for src in self.sources[idx]
                     ]
@@ -221,6 +267,9 @@ class AVSpeechDataModule(object):
         pin_memory: bool = False,
         persistent_workers: bool = False,
         visual_features_path: str = None,
+        train_lmdb: str = None,
+        valid_lmdb: str = None,
+        test_lmdb: str = None,
     ) -> None:
         super().__init__()
         if train_dir == None or valid_dir == None or test_dir == None:
@@ -229,6 +278,17 @@ class AVSpeechDataModule(object):
             raise ValueError("{} is not in [1, 2]".format(n_src))
         # None: online mouth frames + FRCNNVideoModel. Path: precomputed embeddings (see scripts/precompute_visual_embeddings.py).
         self.visual_features_path = visual_features_path
+        # Per-split LMDB databases (tr.lmdb / cv.lmdb / tt.lmdb). None: read the files named in the JSON.
+        self.train_lmdb = train_lmdb
+        self.valid_lmdb = valid_lmdb
+        self.test_lmdb = test_lmdb
+        if self.visual_features_path is not None and any(
+            [train_lmdb, valid_lmdb, test_lmdb]
+        ):
+            raise ValueError(
+                "visual_features_path (precomputed embeddings) reads mouth files from disk and "
+                "cannot be combined with the LMDB options yet."
+            )
 
         # this line allows to access init params with 'self.hparams' attribute
         self.train_dir = train_dir
@@ -261,6 +321,7 @@ class AVSpeechDataModule(object):
             normalize_audio = self.normalize_audio,
             is_train=True,
             visual_cache=cache,
+            lmdb_path=self.train_lmdb,
         )
         self.data_val = AVSpeechDataset(
             json_dir = self.valid_dir,
@@ -270,6 +331,7 @@ class AVSpeechDataModule(object):
             normalize_audio = self.normalize_audio,
             is_train=False,
             visual_cache=cache,
+            lmdb_path=self.valid_lmdb,
         )
         self.data_test = AVSpeechDataset(
             json_dir = self.test_dir,
@@ -279,6 +341,7 @@ class AVSpeechDataModule(object):
             normalize_audio = self.normalize_audio,
             is_train=False,
             visual_cache=cache,
+            lmdb_path=self.test_lmdb,
         )
         if cache is not None:
             # Fail before training if the cache does not cover every visual source of every split.
