@@ -125,7 +125,7 @@ training:
   gpus: [0]
   parallel: ddp
   epochs: 500
-  accumulate_grad_batches: 2  #effective batch size = batch_size * accumulate_grad_batches
+  accumulate_grad_batches: 1  #effective batch size = batch_size * accumulate_grad_batches
   early_stop:
     monitor: val_loss
     mode: min
@@ -156,8 +156,8 @@ datamodule:
     sample_rate: 16000
     segment: 2.0
     normalize_audio: false
-    batch_size: 4
-    num_workers: 12
+    batch_size: 12
+    num_workers: 16
     pin_memory: true
     persistent_workers: false
     visual_features_path: DataPreProcess/LRS2_visual_features   # path to precomputed embeddings; null = online video backbone

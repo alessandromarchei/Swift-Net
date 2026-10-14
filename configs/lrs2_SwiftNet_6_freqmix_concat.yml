@@ -48,8 +48,8 @@ audionet:
         frequency_mixer:
           type: conv
           conv:
-            kernel_sizes: [3, 3, 3]
-            dilations: [1, 2, 4]
+            kernel_sizes: [3, 3, 3, 3, 3]
+            dilations: [1, 2, 4, 8, 16]
             branch_fusion: concat
             hidden_channels: 64
             depthwise: true
@@ -129,7 +129,7 @@ training:
   gpus: [0]
   parallel: ddp
   epochs: 500
-  accumulate_grad_batches: 2  #effective batch size = batch_size * accumulate_grad_batches
+  accumulate_grad_batches: 1  #effective batch size = batch_size * accumulate_grad_batches
   early_stop:
     monitor: val_loss
     mode: min
@@ -160,12 +160,12 @@ datamodule:
     sample_rate: 16000
     segment: 2.0
     normalize_audio: false
-    batch_size: 4
-    num_workers: 12
+    batch_size: 12
+    num_workers: 16
     pin_memory: true
     persistent_workers: false
     visual_features_path: null   # path to precomputed embeddings; null = online video backbone
 
     
 exp:
-  exp_name: LRS2_SwiftNet_6_freqmix_concat
+  exp_name: LRS2_SwiftNet_6_freqmix_v1
