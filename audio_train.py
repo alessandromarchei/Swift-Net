@@ -36,6 +36,10 @@ from look2hear.utils.visual_encoder import (
     validate_visual_training,
     visual_encoder_trainable,
 )
+from look2hear.utils.accelerator_utils import (
+    ACCELERATORS,
+    validate_accelerator_options,
+)
 
 import warnings
 
@@ -58,6 +62,17 @@ parser.add_argument(
     help=(
         "Training precision: "
         "'32-true', 'bf16-mixed', or '16-mixed'."
+    ),
+)
+
+parser.add_argument(
+    "--accelerator",
+    type=str,
+    default="cuda",
+    choices=ACCELERATORS,
+    help=(
+        "Hardware backend: 'cuda' (GPUs, DDP) or 'xla' "
+        "(TPU via torch_xla, uses all visible TPU cores)."
     ),
 )
 
@@ -140,7 +155,7 @@ def get_unique_experiment_name(base_name, experiments_root):
     return f"{base_name}-{next_suffix}"
 
 
-def configure_numerical_precision(tf32_enabled):
+def configure_numerical_precision(tf32_enabled, accelerator="cuda"):
     """
     Configure the behavior of FP32 operations on CUDA.
 
@@ -150,6 +165,10 @@ def configure_numerical_precision(tf32_enabled):
 
     Mixed precision is configured separately in the Trainer.
     """
+    if accelerator == "xla":
+        print_only("XLA backend: TF32 is CUDA-only, ignoring TF32 configuration.")
+        return
+
     if not torch.cuda.is_available():
         print_only("CUDA unavailable: ignoring TF32 configuration.")
         return
@@ -211,8 +230,10 @@ def main(
     wandb_run_id,
     init_ckpt=None,
     init_mode="strict",
+    accelerator="cuda",
 ):
-    configure_numerical_precision(tf32_enabled)
+    validate_accelerator_options(accelerator, precision, torch_compile_enabled)
+    configure_numerical_precision(tf32_enabled, accelerator)
 
     # ------------------------------------------------------------------
     # Unique experiment name
@@ -249,6 +270,12 @@ def main(
     config["runtime"]["wandb_run_id"] = wandb_run_id
     config["runtime"]["init_ckpt"] = init_ckpt
     config["runtime"]["init_mode"] = init_mode
+    config["runtime"]["accelerator"] = accelerator
+
+    # pin_memory only accelerates host-to-GPU copies; it is not used on TPU.
+    if accelerator == "xla" and config["datamodule"]["data_config"].get("pin_memory"):
+        print_only("XLA backend: forcing datamodule pin_memory=False.")
+        config["datamodule"]["data_config"]["pin_memory"] = False
 
     # ------------------------------------------------------------------
     # DataModule
@@ -557,17 +584,28 @@ def main(
     # ------------------------------------------------------------------
     # Hardware
     # ------------------------------------------------------------------
-    gpus = (
-        config["training"]["gpus"]
-        if torch.cuda.is_available()
-        else 1
-    )
+    if accelerator == "xla":
+        # 'auto' takes every TPU core the runtime exposes (8 on a v5e-8).
+        # The XLA strategy is selected by Lightning, so no DDP strategy here.
+        gpus = "auto"
+        distributed_backend = "tpu"
+        strategy = "auto"
+    else:
+        gpus = (
+            config["training"]["gpus"]
+            if torch.cuda.is_available()
+            else 1
+        )
 
-    distributed_backend = (
-        "gpu"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+        distributed_backend = (
+            "gpu"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+
+        strategy = DDPStrategy(
+            find_unused_parameters=True
+        )
 
     # ------------------------------------------------------------------
     # W&B
@@ -588,9 +626,7 @@ def main(
         default_root_dir=exp_dir,
         devices=gpus,
         accelerator=distributed_backend,
-        strategy=DDPStrategy(
-            find_unused_parameters=True
-        ),
+        strategy=strategy,
         limit_train_batches=1.0,
         gradient_clip_val=5.0,
         logger=wandb_logger,
@@ -607,7 +643,12 @@ def main(
         precision=precision,
     )
 
-    
+    print_only(
+        f"Accelerator: {accelerator} | devices: {trainer.num_devices} | "
+        f"per-device batch: {config['datamodule']['data_config']['batch_size']} | "
+        f"global batch: {config['datamodule']['data_config']['batch_size'] * trainer.num_devices}"
+    )
+
     # Restores:
     # - model state;
     # - optimizer state;
@@ -735,4 +776,5 @@ if __name__ == "__main__":
         wandb_run_id=plain_args.wandb_run_id,
         init_ckpt=plain_args.init_ckpt,
         init_mode=plain_args.init_mode,
+        accelerator=plain_args.accelerator,
     )
