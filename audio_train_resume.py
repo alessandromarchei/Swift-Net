@@ -28,6 +28,13 @@ from look2hear.utils.checkpoint_utils import (
     LEGACY_MONITOR,
     upgrade_legacy_monitor,
 )
+from look2hear.utils.visual_encoder import (
+    build_optimizer_params,
+    check_resume_compatibility,
+    export_payload,
+    validate_visual_training,
+    visual_encoder_trainable,
+)
 
 import warnings
 
@@ -341,6 +348,14 @@ def main(
             "FRCNNVideoModel is not instantiated."
         )
 
+    # Must match the checkpoint: checked below, before any weights are restored.
+    visual_trainable = visual_encoder_trainable(config["videonet"])
+    validate_visual_training(visual_trainable, visual_mode)
+    print_only(
+        "Visual encoder: "
+        + ("trainable (fine-tuned with the separator)" if visual_trainable else "frozen")
+    )
+
     # ------------------------------------------------------------------
     # Optimizer
     # ------------------------------------------------------------------
@@ -351,7 +366,12 @@ def main(
     )
 
     optimizer = make_optimizer(
-        model.parameters(),
+        build_optimizer_params(
+            model,
+            video_model,
+            visual_trainable,
+            visual_lr=config["videonet"].get("visual_lr"),
+        ),
         **config["optimizer"],
     )
 
@@ -441,6 +461,7 @@ def main(
         scheduler=scheduler,
         config=config,
         visual_mode=visual_mode,
+        visual_trainable=visual_trainable,
     )
 
     # Per default il Trainer usa il normale LightningModule.
@@ -566,6 +587,7 @@ def main(
     # are migrated into a copy inside the new experiment directory. The original file is never modified.
     resume_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     check_architecture(resume_data, model.architecture_summary())
+    check_resume_compatibility(resume_data, visual_trainable)
     ckpt_has_video = any(k.startswith("video_model.") for k in resume_data["state_dict"])
     if visual_mode == "online" and not ckpt_has_video:
         raise ValueError(
@@ -679,10 +701,11 @@ def main(
             "best_model.pth",
         )
 
-        serialized_audio_model = base_system.audio_model.serialize()
+        # Frozen: the separator only, as before. Trainable: the separator plus the updated encoder, one file.
+        serialized_model = export_payload(base_system, config["videonet"])
 
         torch.save(
-            serialized_audio_model,
+            serialized_model,
             output_model_path,
         )
 
