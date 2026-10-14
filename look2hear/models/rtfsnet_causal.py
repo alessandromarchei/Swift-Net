@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from sru import SRU
+from ..layers.sru import SRU
 from .base_model import BaseModel
 from timm.models.layers import DropPath
 from ..layers import normalizations, activations

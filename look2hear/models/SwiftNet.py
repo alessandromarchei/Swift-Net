@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from sru import SRU
+# Drop-in for the pip ``sru`` package: same weights and math, also runs on XLA/TPU.
+from ..layers.sru import SRU, run_srus_together
+from ..layers import dft_stft, xla_ops
 from .base_model import BaseModel
 from timm.models.layers import DropPath
 from ..layers import normalizations, activations
@@ -223,8 +225,8 @@ class GRNN(nn.Module):
         h: (num_layers, B, hidden_size)
         """
         x1, x2 = torch.chunk(x, chunks=2, dim=-1)
-        y1, h1 = self.rnn1(x1)
-        y2, h2 = self.rnn2(x2)
+        # Same result as calling rnn1 and rnn2 one after the other; off CUDA both share one time loop.
+        (y1, h1), (y2, h2) = run_srus_together([self.rnn1, self.rnn2], [x1, x2])
         y = torch.cat([y1, y2], dim=-1)
         return y
 
@@ -281,13 +283,14 @@ class InjectionMultiSum(nn.Module):
         new_shape = local_features.shape[-(len(local_features.shape) // 2) :]
 
         local_emb = self.local_embedding(local_features)
+        # xla_ops.* = the F.* op off XLA; on XLA the same values without host fallbacks.
         if torch.prod(torch.tensor(new_shape)) > torch.prod(torch.tensor(old_shape)):
-            global_emb = F.interpolate(self.global_embedding(global_features), size=new_shape, mode="nearest")
-            gate = F.interpolate(self.global_gate(global_features), size=new_shape, mode="nearest")
+            global_emb = xla_ops.interpolate_nearest(self.global_embedding(global_features), new_shape)
+            gate = xla_ops.interpolate_nearest(self.global_gate(global_features), new_shape)
         else:
-            g_interp = F.interpolate(global_features, size=new_shape, mode="nearest")
-            global_emb =  F.interpolate(self.global_embedding(g_interp), size=new_shape, mode="nearest")
-            gate = F.interpolate(self.global_gate(g_interp), size=new_shape, mode="nearest")
+            g_interp = xla_ops.interpolate_nearest(global_features, new_shape)
+            global_emb = xla_ops.interpolate_nearest(self.global_embedding(g_interp), new_shape)
+            gate = xla_ops.interpolate_nearest(self.global_gate(g_interp), new_shape)
 
         injection_sum = local_emb * gate + global_emb
 
@@ -370,7 +373,10 @@ class DualPathRNN(nn.Module):
             residual = x
             x = self.norm(x)
             x = x.permute(0, 3, 1, 2).contiguous().view(B * new_F, C, new_T, 1)
-            x = self.unfold(x)  # B * new_F, C * kernel_size, unfolded_T
+            if x.device.type == "xla":  # nn.Unfold (im2col) runs on the host on XLA
+                x = xla_ops.unfold_kx1(x, self.kernel_size, self.stride)
+            else:
+                x = self.unfold(x)  # B * new_F, C * kernel_size, unfolded_T
             x = x.permute(2, 0, 1)  # unfolded_T, B * new_F, C * kernel_size
             x = self.rnn(x)
             x = x.permute(1, 2, 0)
@@ -794,7 +800,10 @@ class FTGS(nn.Module):
 
         # global pooling
         shape = downsampled_outputs[-1].shape
-        global_features = sum(self.pool(features, output_size=shape[-(len(shape) // 2) :]) for features in downsampled_outputs)
+        if shape and downsampled_outputs[-1].device.type == "xla":  # same pooling, without host fallback
+            global_features = sum(xla_ops.adaptive_avg_pool(features, shape[-(len(shape) // 2) :]) for features in downsampled_outputs)
+        else:
+            global_features = sum(self.pool(features, output_size=shape[-(len(shape) // 2) :]) for features in downsampled_outputs)
         
         # global attention module
         global_features = self.process_f(global_features)
@@ -809,7 +818,7 @@ class FTGS(nn.Module):
         for i in range(self.upsampling_depth - 3, -1, -1):
             expanded = self.concat_layers[i](x_fused[i], expanded) + downsampled_outputs[i]
 
-        expanded = F.interpolate(expanded, size=residual.shape[-(len(residual.shape) // 2) :], mode="nearest")
+        expanded = xla_ops.interpolate_nearest(expanded, residual.shape[-(len(residual.shape) // 2) :])
         out = self.residual_conv(expanded) + residual
 
         return out
@@ -943,8 +952,8 @@ class SAF(nn.Module):
         gamma_beta = self.param_gen(tensor_b)              # [B, 2*C, T]
         gamma, beta = torch.split(gamma_beta, C_, dim=1)  # [B, C, T]
         # Expand dimensions for frequency-wise element-wise multiplication/addition with audio features
-        gamma = F.interpolate(gamma, size=T_, mode="nearest")
-        beta = F.interpolate(beta, size=T_, mode="nearest")
+        gamma = xla_ops.interpolate_nearest(gamma, T_)
+        beta = xla_ops.interpolate_nearest(beta, T_)
         gamma = gamma.unsqueeze(-1)  # [B, C, T, 1]
         beta  = beta.unsqueeze(-1)   # [B, C, T, 1]
         # Element-wise scaling and biasing
@@ -1181,6 +1190,14 @@ class STFTEncoder(nn.Module):
     def forward(self, x: torch.Tensor):
         x = self.unsqueeze_to_2D(x)
 
+        if x.device.type == "xla":
+            # XLA has no FFT lowering (torch.stft would run on the host every step), and
+            # complex abs() returns a complex dtype there: same transform as DFT matmuls.
+            real, imag = dft_stft.stft(x, self.win, self.hop_length, self.window.to(x.device))
+            this_spec = (real.square() + imag.square() + self.eps).sqrt()
+            spec = torch.stack([real, imag, this_spec], 1).transpose(2, 3).contiguous()  # B, 3, T, F
+            return self.conv(spec)
+
         spec = torch.stft(
             x,
             n_fft=self.win,
@@ -1249,6 +1266,13 @@ class STFTDecoder(nn.Module):
 
         if self.causal:
             decoded_separated_audio = decoded_separated_audio[:, :, :-self.padding, :]
+
+        if decoded_separated_audio.device.type == "xla":
+            # Same iSTFT as below, as DFT matmuls (no FFT lowering on XLA, see STFTEncoder).
+            real = decoded_separated_audio[:, 0].transpose(1, 2)  # B*n_src, F, T
+            imag = decoded_separated_audio[:, 1].transpose(1, 2)
+            output = dft_stft.istft(real, imag, self.win, self.hop_length, self.window.to(x.device), length)
+            return output.view(batch_size, self.n_src, length)
 
         #prevent complex tensor from being casted eventually to bf16
         with torch.autocast(

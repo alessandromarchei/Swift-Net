@@ -16,6 +16,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
     ModelCheckpoint,
     EarlyStopping,
+    TQDMProgressBar,
 )
 from pytorch_lightning.callbacks.progress.rich_progress import *
 from pytorch_lightning.loggers import WandbLogger
@@ -38,7 +39,9 @@ from look2hear.utils.visual_encoder import (
 )
 from look2hear.utils.accelerator_utils import (
     ACCELERATORS,
+    XLAMatmulPrecision,
     validate_accelerator_options,
+    xla_trainer_precision,
 )
 
 import warnings
@@ -73,6 +76,16 @@ parser.add_argument(
     help=(
         "Hardware backend: 'cuda' (GPUs, DDP) or 'xla' "
         "(TPU via torch_xla, uses all visible TPU cores)."
+    ),
+)
+
+parser.add_argument(
+    "--tpu_cores",
+    type=str,
+    default="auto",
+    help=(
+        "With --accelerator xla: 'auto' for every TPU core (8 on a v5e-8) or 1 (Lightning accepts only these). "
+        "datamodule.batch_size is per core, so the global batch grows with the core count."
     ),
 )
 
@@ -166,7 +179,10 @@ def configure_numerical_precision(tf32_enabled, accelerator="cuda"):
     Mixed precision is configured separately in the Trainer.
     """
     if accelerator == "xla":
-        print_only("XLA backend: TF32 is CUDA-only, ignoring TF32 configuration.")
+        print_only(
+            "XLA backend: float32 matmul precision "
+            + ("'high' (--tf32)." if tf32_enabled else "'highest' (float32).")
+        )
         return
 
     if not torch.cuda.is_available():
@@ -231,6 +247,7 @@ def main(
     init_ckpt=None,
     init_mode="strict",
     accelerator="cuda",
+    tpu_cores="auto",
 ):
     validate_accelerator_options(accelerator, precision, torch_compile_enabled)
     configure_numerical_precision(tf32_enabled, accelerator)
@@ -271,6 +288,7 @@ def main(
     config["runtime"]["init_ckpt"] = init_ckpt
     config["runtime"]["init_mode"] = init_mode
     config["runtime"]["accelerator"] = accelerator
+    config["runtime"]["tpu_cores"] = tpu_cores
 
     # pin_memory only accelerates host-to-GPU copies; it is not used on TPU.
     if accelerator == "xla" and config["datamodule"]["data_config"].get("pin_memory"):
@@ -565,6 +583,13 @@ def main(
 
     callbacks.append(checkpoint)
 
+    if accelerator == "xla":
+        # Without it TPU float32 matmuls/convs run as a single bfloat16 pass.
+        callbacks.append(XLAMatmulPrecision(tf32_enabled))
+        # The progress bar reads train_loss from the TPU at each refresh. Refreshing every step
+        # makes the host wait for every step instead of tracing the next one meanwhile.
+        callbacks.append(TQDMProgressBar(refresh_rate=50))
+
     upgrade_legacy_monitor(config)
     if config["training"]["early_stop"]:
         print_only("Instantiating EarlyStopping")
@@ -585,9 +610,9 @@ def main(
     # Hardware
     # ------------------------------------------------------------------
     if accelerator == "xla":
-        # 'auto' takes every TPU core the runtime exposes (8 on a v5e-8).
+        # 'auto' (default) takes every TPU core the runtime exposes (8 on a v5e-8).
         # The XLA strategy is selected by Lightning, so no DDP strategy here.
-        gpus = "auto"
+        gpus = "auto" if str(tpu_cores) == "auto" else int(tpu_cores)
         distributed_backend = "tpu"
         strategy = "auto"
     else:
@@ -640,7 +665,8 @@ def main(
         ],
 
         # 32-true, bf16-mixed, or 16-mixed.
-        precision=precision,
+        # On XLA, 'bf16-mixed' needs a plugin (Lightning only offers *-true there).
+        **({"precision": precision} if accelerator != "xla" else xla_trainer_precision(precision)),
     )
 
     print_only(
@@ -777,4 +803,5 @@ if __name__ == "__main__":
         init_ckpt=plain_args.init_ckpt,
         init_mode=plain_args.init_mode,
         accelerator=plain_args.accelerator,
+        tpu_cores=plain_args.tpu_cores,
     )

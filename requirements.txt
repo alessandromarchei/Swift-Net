@@ -34,6 +34,7 @@ kiwisolver
 lazy-loader
 lightning-utilities
 llvmlite
+lmdb
 markdown-it-py
 matplotlib
 mdurl
@@ -42,7 +43,7 @@ mmengine
 msgpack
 multidict
 mypy-extensions
-ninja.4
+ninja
 numba
 numpy
 # nvidia-cublas-cu12.1
@@ -59,7 +60,7 @@ numpy
 # nvidia-nvjitlink-cu12
 # nvidia-nvtx-cu12
 oauthlib
-opencv-python.80
+opencv-python
 packaging
 pathspec
 pillow
@@ -77,10 +78,11 @@ pygments
 pyparsing
 pypesq
 pystoi
-python-dateutil.post0
+python-dateutil
 pytorch-lightning
 pytorch-ranger
-pytz-oauthlib
+pytz
+requests-oauthlib
 rich
 rsa
 scikit-image
@@ -93,13 +95,13 @@ six
 smmap
 sortedcontainers
 soundfile
-soxr.post1
+soxr
 sru
 sympy
 tensorboard
 tensorboard-data-server
 termcolor
-thop-2209072238
+thop
 threadpoolctl
 tifffile
 timm

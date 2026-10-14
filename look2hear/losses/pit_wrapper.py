@@ -48,6 +48,16 @@ class PITLossWrapper(nn.Module):
         min_loss, batch_indices = self.find_best_perm(
             pw_loss, perm_reduce=self.perm_reduce, **reduce_kwargs
         )
+        if self.threshold_byloss and min_loss.device.type == "xla":
+            # Same rule with static shapes: boolean indexing and the `if` below would make XLA
+            # stop the graph and copy to the host every step.
+            keep = min_loss > -30
+            count = keep.sum()
+            kept_mean = torch.where(keep, min_loss, torch.zeros_like(min_loss)).sum() / count.clamp(min=1)
+            mean_loss = torch.where(count > 0, kept_mean, torch.mean(min_loss))
+            if not return_ests:
+                return mean_loss
+            return mean_loss, self.reordered_sources(ests, batch_indices)
         if self.threshold_byloss:
             if min_loss[min_loss > -30].nelement() > 0:
                 min_loss = min_loss[min_loss > -30]
@@ -118,8 +128,8 @@ class PITLossWrapper(nn.Module):
         # Indexes and values of min losses for each batch element
         min_loss, min_loss_idx = torch.min(loss_set, dim=1)
 
-        # Permutation indices for each batch.
-        batch_indices = torch.stack([perms[m] for m in min_loss_idx], dim=0)
+        # Permutation indices for each batch (one gather; indexing per element syncs XLA).
+        batch_indices = perms[min_loss_idx]
         return min_loss, batch_indices
 
     def find_best_perm_hungarian(self, pair_wise_losses: torch.Tensor):

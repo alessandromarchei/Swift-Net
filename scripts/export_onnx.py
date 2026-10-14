@@ -28,7 +28,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from sru import SRU as OptimizedSRU
+from look2hear.layers.sru import SRU as OptimizedSRU  # every SwiftNet SRU (pip sru drop-in)
 
 # Suppress import-time deprecation warnings before importing the repository.
 warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
