@@ -8,6 +8,10 @@ from timm.models.layers import DropPath
 from ..layers import normalizations, activations
 from .frequency_mixer import build_frequency_module, parse_frequency_mixer_config
 
+# The SRU CUDA kernel is a custom op that dynamo cannot trace: under torch.compile it always runs
+# eagerly (clean graph break) instead of failing and dumping a traceback for every compiled frame.
+SRU.forward = torch.compiler.disable(SRU.forward)
+
 class ConvNormAct(nn.Module):
     def __init__(
         self,
