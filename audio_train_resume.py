@@ -28,6 +28,17 @@ from look2hear.utils.checkpoint_utils import (
     LEGACY_MONITOR,
     upgrade_legacy_monitor,
 )
+from look2hear.utils.visual_encoder import (
+    build_optimizer_params,
+    check_resume_compatibility,
+    export_payload,
+    validate_visual_training,
+    visual_encoder_trainable,
+)
+from look2hear.utils.accelerator_utils import (
+    ACCELERATORS,
+    validate_accelerator_options,
+)
 
 import warnings
 
@@ -57,6 +68,17 @@ parser.add_argument(
     help=(
         "Precision to use after resuming: "
         "'32-true', 'bf16-mixed', or '16-mixed'."
+    ),
+)
+
+parser.add_argument(
+    "--accelerator",
+    type=str,
+    default="cuda",
+    choices=ACCELERATORS,
+    help=(
+        "Hardware backend: 'cuda' (GPUs, DDP) or 'xla' "
+        "(TPU via torch_xla, uses all visible TPU cores)."
     ),
 )
 
@@ -142,7 +164,11 @@ def validate_checkpoint_path(checkpoint_path):
     return checkpoint_path
 
 
-def configure_numerical_precision(tf32_enabled):
+def configure_numerical_precision(tf32_enabled, accelerator="cuda"):
+    if accelerator == "xla":
+        print_only("XLA backend: TF32 is CUDA-only, ignoring TF32 configuration.")
+        return
+
     if not torch.cuda.is_available():
         print_only("CUDA unavailable: ignoring TF32 configuration.")
         return
@@ -201,10 +227,12 @@ def main(
     torch_compile_enabled,
     compile_mode,
     wandb_run_id,
+    accelerator="cuda",
 ):
     checkpoint_path = validate_checkpoint_path(checkpoint_path)
 
-    configure_numerical_precision(tf32_enabled)
+    validate_accelerator_options(accelerator, precision, torch_compile_enabled)
+    configure_numerical_precision(tf32_enabled, accelerator)
 
     # ------------------------------------------------------------------
     # Unique directory for this training run
@@ -275,6 +303,12 @@ def main(
     config["runtime"]["torch_compile"] = torch_compile_enabled
     config["runtime"]["compile_mode"] = compile_mode
     config["runtime"]["wandb_run_id"] = wandb_run_id
+    config["runtime"]["accelerator"] = accelerator
+
+    # pin_memory only accelerates host-to-GPU copies; it is not used on TPU.
+    if accelerator == "xla" and config["datamodule"]["data_config"].get("pin_memory"):
+        print_only("XLA backend: forcing datamodule pin_memory=False.")
+        config["datamodule"]["data_config"]["pin_memory"] = False
 
     # ------------------------------------------------------------------
     # DataModule
@@ -341,6 +375,14 @@ def main(
             "FRCNNVideoModel is not instantiated."
         )
 
+    # Must match the checkpoint: checked below, before any weights are restored.
+    visual_trainable = visual_encoder_trainable(config["videonet"])
+    validate_visual_training(visual_trainable, visual_mode)
+    print_only(
+        "Visual encoder: "
+        + ("trainable (fine-tuned with the separator)" if visual_trainable else "frozen")
+    )
+
     # ------------------------------------------------------------------
     # Optimizer
     # ------------------------------------------------------------------
@@ -351,7 +393,12 @@ def main(
     )
 
     optimizer = make_optimizer(
-        model.parameters(),
+        build_optimizer_params(
+            model,
+            video_model,
+            visual_trainable,
+            visual_lr=config["videonet"].get("visual_lr"),
+        ),
         **config["optimizer"],
     )
 
@@ -441,6 +488,7 @@ def main(
         scheduler=scheduler,
         config=config,
         visual_mode=visual_mode,
+        visual_trainable=visual_trainable,
     )
 
     # Per default il Trainer usa il normale LightningModule.
@@ -510,17 +558,28 @@ def main(
     # ------------------------------------------------------------------
     # Hardware
     # ------------------------------------------------------------------
-    gpus = (
-        config["training"]["gpus"]
-        if torch.cuda.is_available()
-        else 1
-    )
+    if accelerator == "xla":
+        # 'auto' takes every TPU core the runtime exposes (8 on a v5e-8).
+        # The XLA strategy is selected by Lightning, so no DDP strategy here.
+        gpus = "auto"
+        distributed_backend = "tpu"
+        strategy = "auto"
+    else:
+        gpus = (
+            config["training"]["gpus"]
+            if torch.cuda.is_available()
+            else 1
+        )
 
-    distributed_backend = (
-        "gpu"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+        distributed_backend = (
+            "gpu"
+            if torch.cuda.is_available()
+            else "cpu"
+        )
+
+        strategy = DDPStrategy(
+            find_unused_parameters=True
+        )
 
     # ------------------------------------------------------------------
     # W&B
@@ -541,9 +600,7 @@ def main(
         default_root_dir=exp_dir,
         devices=gpus,
         accelerator=distributed_backend,
-        strategy=DDPStrategy(
-            find_unused_parameters=True
-        ),
+        strategy=strategy,
         limit_train_batches=1.0,
         gradient_clip_val=5.0,
         logger=wandb_logger,
@@ -561,11 +618,18 @@ def main(
         precision=precision,
     )
 
+    print_only(
+        f"Accelerator: {accelerator} | devices: {trainer.num_devices} | "
+        f"per-device batch: {config['datamodule']['data_config']['batch_size']} | "
+        f"global batch: {config['datamodule']['data_config']['batch_size'] * trainer.num_devices}"
+    )
+
     # Checkpoint compatibility checks. Resuming requires the same architecture.
     # Checkpoints from before the monitor rename, or from the online visual mode,
     # are migrated into a copy inside the new experiment directory. The original file is never modified.
     resume_data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     check_architecture(resume_data, model.architecture_summary())
+    check_resume_compatibility(resume_data, visual_trainable)
     ckpt_has_video = any(k.startswith("video_model.") for k in resume_data["state_dict"])
     if visual_mode == "online" and not ckpt_has_video:
         raise ValueError(
@@ -679,10 +743,11 @@ def main(
             "best_model.pth",
         )
 
-        serialized_audio_model = base_system.audio_model.serialize()
+        # Frozen: the separator only, as before. Trainable: the separator plus the updated encoder, one file.
+        serialized_model = export_payload(base_system, config["videonet"])
 
         torch.save(
-            serialized_audio_model,
+            serialized_model,
             output_model_path,
         )
 
@@ -721,4 +786,5 @@ if __name__ == "__main__":
         torch_compile_enabled=plain_args.torch_compile,
         compile_mode=plain_args.compile_mode,
         wandb_run_id=plain_args.wandb_run_id,
+        accelerator=plain_args.accelerator,
     )

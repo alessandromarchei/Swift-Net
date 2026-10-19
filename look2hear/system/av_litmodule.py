@@ -40,9 +40,10 @@ class AudioVisualLightningModule(pl.LightningModule):
         scheduler=None,
         config=None,
         visual_mode="online",
+        visual_trainable=False,
     ):
         super().__init__()
-        # "online": mouth frames go through the frozen video_model at every step.
+        # "online": mouth frames go through video_model at every step; frozen unless visual_trainable.
         # "cached": the batch already contains precomputed embeddings [B, D, T]; video_model must be None.
         if visual_mode not in ("online", "cached"):
             raise ValueError(f"visual_mode must be 'online' or 'cached', got {visual_mode!r}")
@@ -50,10 +51,17 @@ class AudioVisualLightningModule(pl.LightningModule):
             raise ValueError("visual_mode='cached' must not instantiate the video model")
         if visual_mode == "online" and video_model is None:
             raise ValueError("visual_mode='online' requires a video model")
+        if visual_trainable and visual_mode != "online":
+            raise ValueError("visual_trainable=True requires visual_mode='online'")
 
         self.audio_model = audio_model
         self.video_model = video_model
         self.visual_mode = visual_mode
+        self.visual_trainable = bool(visual_trainable)
+        if self.video_model is not None:
+            # FRCNNVideoModel.init_from sets requires_grad=False on every parameter: restore it when training.
+            for p in self.video_model.parameters():
+                p.requires_grad_(self.visual_trainable)
         self.optimizer = optimizer
         self.loss_func = loss_func
         self.train_loader = train_loader
@@ -80,8 +88,11 @@ class AudioVisualLightningModule(pl.LightningModule):
         else:
             if mouth.ndim == 4:
                 mouth = mouth.unsqueeze(1)
-            with torch.no_grad():
+            if self.visual_trainable:
                 mouth_emb = self.video_model(mouth.type_as(wav))
+            else:
+                with torch.no_grad():
+                    mouth_emb = self.video_model(mouth.type_as(wav))
         return self.audio_model(wav, mouth_emb)
 
     def training_step(self, batch, batch_nb):
@@ -209,6 +220,8 @@ class AudioVisualLightningModule(pl.LightningModule):
         checkpoint["training_config"] = self.config
         # Records which architecture and visual input produced the weights.
         checkpoint["visual_mode"] = self.visual_mode
+        # Needed on resume: the optimizer state layout depends on whether the encoder is trained.
+        checkpoint["visual_encoder_trainable"] = self.visual_trainable
         if hasattr(self.audio_model, "architecture_summary"):
             checkpoint["architecture"] = self.audio_model.architecture_summary()
         return checkpoint
