@@ -37,9 +37,12 @@ class FRCNNVideoModel(nn.Module):
         relu_type="prelu",
         width_mult=1.0,
         pretrain=None,
+        causal=False,
     ):
         super(FRCNNVideoModel, self).__init__()
         self.backbone_type = backbone_type
+        self.causal = causal
+
         if self.backbone_type == "resnet":
             self.frontend_nout = 64
             self.backend_out = 512
@@ -59,25 +62,36 @@ class FRCNNVideoModel(nn.Module):
             if relu_type == "prelu"
             else nn.ReLU()
         )
+
+        # Causal padding uses the previous 4 frames and the current frame.
+        # Non-causal padding uses 2 past and 2 future frames.
+        # Keep Conv3d at index 0 for compatibility with pretrained checkpoints.
         self.frontend3D = nn.Sequential(
             nn.Conv3d(
                 1,
                 self.frontend_nout,
                 kernel_size=(5, 7, 7),
                 stride=(1, 2, 2),
-                padding=(2, 3, 3),
+                padding=(0, 3, 3) if causal else (2, 3, 3),
                 bias=False,
             ),
             nn.BatchNorm3d(self.frontend_nout),
             frontend_relu,
             nn.MaxPool3d(kernel_size=(1, 3, 3), stride=(1, 2, 2), padding=(0, 1, 1)),
         )
+
         self.pretrain = pretrain
         if pretrain:
             self.init_from(pretrain)
 
     def forward(self, x):
         B, C, T, H, W = x.size()
+
+        # F.pad order for 5D tensors:
+        # (W_left, W_right, H_top, H_bottom, T_left, T_right)
+        if self.causal:
+            x = nn.functional.pad(x, (0, 0, 0, 0, 4, 0))
+
         x = self.frontend3D(x)
         Tnew = x.shape[2]  # output should be B x C2 x Tnew x H x W
         x = threeD_to_2D_tensor(x)
