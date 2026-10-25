@@ -56,9 +56,18 @@ def main(config):
         sample_rate=config["train_conf"]["datamodule"]["data_config"]["sample_rate"],
         **config["train_conf"]["audionet"]["audionet_config"],
     )
-    video_model = getattr(look2hear.videomodels, config["train_conf"]["videonet"]["videonet_name"])(
-        **config["train_conf"]["videonet"]["videonet_config"],
-    )
+    # A model trained with videonet.freeze_visual_encoder: false carries its fine-tuned encoder in the same file.
+    # Otherwise the encoder comes from the config (pretrained backbone, as before).
+    saved = torch.load(model_path, map_location="cpu", weights_only=False)
+    if "visual_encoder" in saved:
+        enc = saved["visual_encoder"]
+        video_model = getattr(look2hear.videomodels, enc["videonet_name"])(**enc["videonet_config"])
+        video_model.load_state_dict(enc["state_dict"], strict=True)
+    else:
+        video_model = getattr(look2hear.videomodels, config["train_conf"]["videonet"]["videonet_name"])(
+            **config["train_conf"]["videonet"]["videonet_config"],
+        )
+    del saved
     if config["train_conf"]["training"]["gpus"]:
         device = "cuda"
         model.to(device)
