@@ -10,7 +10,7 @@ import look2hear.models
 import look2hear.system
 import look2hear.losses
 import look2hear.videomodels
-from look2hear.system import make_optimizer
+from look2hear.system import make_optimizer, make_scheduler
 from look2hear.models.frequency_mixer import describe_frequency_module
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import (
@@ -408,11 +408,9 @@ def main(
             )
         )
 
-        scheduler = getattr(
-            torch.optim.lr_scheduler,
+        scheduler = make_scheduler(
             config["scheduler"]["sche_name"],
-        )(
-            optimizer=optimizer,
+            optimizer,
             **config["scheduler"]["sche_config"],
         )
 
