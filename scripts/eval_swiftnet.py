@@ -337,7 +337,7 @@ def main(args):
     rng = random.Random(args.seed)
     example_idx = set(rng.sample(range(n_items), min(args.num_audio, n_items)))
 
-    loader = DataLoader(Subset(dataset, range(n_items)), batch_size=1, shuffle=False,
+    loader = DataLoader(Subset(dataset, range(n_items)), batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda")
 
     per_sample, examples = [], []
@@ -436,6 +436,7 @@ def parse_args(argv=None):
     p.add_argument("--sdr_filter_length", type=int, default=512, help="BSS-eval distortion filter length")
     p.add_argument("--no_pesq_stoi", action="store_true", help="skip PESQ and STOI (faster)")
     p.add_argument("--out_root", default=os.path.join("Experiments", "eval"))
+    p.add_argument("--batch_size", default=1)
     p.add_argument("--exp_name", default=None,
                    help="name of the eval folder. Default: <config>__<run>__<ckpt>__<split>")
     return p.parse_args(argv)
