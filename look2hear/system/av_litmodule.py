@@ -1,7 +1,7 @@
 import torch
 import pytorch_lightning as pl
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from .schedulers import WarmupCosineLR
+from .schedulers import ConstantCosineLR, WarmupCosineLR
 from collections.abc import MutableMapping
 
 
@@ -197,6 +197,10 @@ class AudioVisualLightningModule(pl.LightningModule):
                 elif isinstance(sched, WarmupCosineLR):
                     # Step budget known only now: accounts for devices and accumulate_grad_batches
                     sched.set_total_steps(self.trainer.estimated_stepping_batches, self.trainer.max_epochs)
+                    sched = {"scheduler": sched, "interval": "step", "frequency": 1}
+                elif isinstance(sched, ConstantCosineLR):
+                    # Indexed by global step: Lightning steps it after each real optimizer step only,
+                    # so accumulate_grad_batches is accounted for.
                     sched = {"scheduler": sched, "interval": "step", "frequency": 1}
                 epoch_schedulers.append(sched)
             else:

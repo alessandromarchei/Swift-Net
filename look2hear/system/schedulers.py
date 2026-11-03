@@ -63,8 +63,98 @@ class WarmupCosineLR(LRScheduler):
         return [base_lr * self._factor(step, base_lr) for base_lr in self.base_lrs]
 
 
+def _as_step_count(name, value):
+    """Read a step count from the YAML: ints, integral floats (``1.0e+5``) and numeric strings (``1e5``)."""
+    try:
+        as_float = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be an integer number of optimizer steps, got {value!r}") from None
+    if not as_float.is_integer():
+        raise ValueError(f"{name} must be an integer number of optimizer steps, got {value!r}")
+    return int(as_float)
+
+
+class ConstantCosineLR(LRScheduler):
+    """Constant learning rate, then cosine annealing to ``min_lr``, stepped once per optimizer step.
+
+    ``t`` is the global step, i.e. the number of optimizer steps already taken (``trainer.global_step``).
+    The optimizer step with global step ``t`` uses
+
+        t <  constant_steps:                 base_lr
+        constant_steps <= t < total_steps:   min_lr + (base_lr - min_lr) / 2 * (1 + cos(pi * (t - constant_steps)
+                                                                              / (total_steps - constant_steps)))
+        t >= total_steps:                    min_lr
+
+    ``base_lr`` is the optimizer lr of each param group (``optimizer.lr``, or ``videonet.visual_lr`` for the
+    encoder group). The lr at ``t == constant_steps`` is still ``base_lr`` and the lr at ``t == total_steps``
+    is exactly ``min_lr``.
+
+    The scheduler's ``last_epoch`` equals ``t``: construction applies the lr of step 0, and Lightning calls
+    ``step()`` after every real ``optimizer.step()`` (never during gradient accumulation), which moves to
+    the lr of the next global step. The lr is a closed-form function of ``last_epoch``, so restoring the
+    scheduler state from a checkpoint continues on the same curve.
+
+    Args:
+        optimizer: wrapped optimizer.
+        constant_steps (int): optimizer steps at the initial lr.
+        total_steps (int): global step at which ``min_lr`` is reached.
+        min_lr (float): final learning rate, kept after ``total_steps``.
+    """
+
+    def __init__(self, optimizer, constant_steps, total_steps, min_lr=0.0, last_epoch=-1):
+        constant_steps = _as_step_count("constant_steps", constant_steps)
+        total_steps = _as_step_count("total_steps", total_steps)
+        min_lr = float(min_lr)
+        if not 0 <= constant_steps < total_steps:
+            raise ValueError(
+                f"Need 0 <= constant_steps < total_steps, got constant_steps={constant_steps}, "
+                f"total_steps={total_steps}"
+            )
+        for i, group in enumerate(optimizer.param_groups):
+            initial_lr = group.get("initial_lr", group["lr"])
+            if not 0.0 <= min_lr <= initial_lr:
+                raise ValueError(
+                    f"Need 0 <= min_lr <= initial lr, got min_lr={min_lr} and lr={initial_lr} (param group {i})"
+                )
+        self.constant_steps = constant_steps
+        self.total_steps = total_steps
+        self.min_lr = min_lr
+        super().__init__(optimizer, last_epoch)
+
+    def lr_at(self, step, base_lr):
+        """Learning rate used by the optimizer step with global step ``step``."""
+        if step < self.constant_steps:
+            return base_lr
+        if step >= self.total_steps:
+            return self.min_lr
+        progress = (step - self.constant_steps) / (self.total_steps - self.constant_steps)
+        return self.min_lr + (base_lr - self.min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def get_lr(self):
+        step = max(self.last_epoch, 0)
+        return [self.lr_at(step, base_lr) for base_lr in self.base_lrs]
+
+    def load_state_dict(self, state_dict):
+        """Restore position and schedule from a checkpoint; report if the configured schedule differs.
+
+        The checkpoint wins so that a resumed run continues exactly on the curve it was trained with.
+        """
+        configured = (self.constant_steps, self.total_steps, self.min_lr)
+        super().load_state_dict(state_dict)
+        restored = (self.constant_steps, self.total_steps, self.min_lr)
+        if configured != restored:
+            print(
+                "ConstantCosineLR: the checkpoint schedule (constant_steps, total_steps, min_lr)="
+                f"{restored} differs from the configured {configured}; continuing with the checkpoint schedule."
+            )
+
+
 # Schedulers defined here, looked up by name before falling back to torch.optim.lr_scheduler
-_SCHEDULERS = {"WarmupCosineLR": WarmupCosineLR}
+_SCHEDULERS = {
+    "WarmupCosineLR": WarmupCosineLR,
+    "ConstantCosineLR": ConstantCosineLR,
+    "constant_cosine": ConstantCosineLR,
+}
 
 
 def make_scheduler(sche_name, optimizer, **sche_config):

@@ -144,6 +144,15 @@ scheduler:
   sche_config:
     patience: 10
     factor: 0.5
+# Alternative: constant lr (optimizer.lr) for constant_steps optimizer steps, then cosine
+# annealing to min_lr at global step total_steps, min_lr afterwards. Steps are optimizer steps
+# (one per accumulate_grad_batches batches), independent of training.epochs.
+# scheduler:
+#   sche_name: ConstantCosineLR
+#   sche_config:
+#     constant_steps: 100000
+#     total_steps: 300000
+#     min_lr: 1.0e-5
 
 # Data config
 datamodule:
