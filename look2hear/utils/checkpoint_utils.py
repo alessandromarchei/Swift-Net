@@ -4,7 +4,12 @@ Nothing here loads weights silently: every skipped or missing key is reported, a
 architecture mismatch raises unless the caller asks for partial loading.
 """
 
+import copy
+
+import pytorch_lightning as pl
 import torch
+from pytorch_lightning.callbacks import EarlyStopping
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 LEGACY_MONITOR = "val_loss/dataloader_idx_0"
 MONITOR = "val_loss"
@@ -106,3 +111,52 @@ def upgrade_legacy_monitor(config):
         es["monitor"] = MONITOR
         print(f"Warning: early_stop.monitor '{LEGACY_MONITOR}' is renamed to '{MONITOR}'.")
     return config
+
+
+# ReduceLROnPlateau settings taken from the config on resume. The progress (best, num_bad_epochs,
+# cooldown_counter, last_epoch) stays the checkpoint's.
+_PLATEAU_SETTINGS = ("factor", "patience", "cooldown", "threshold", "threshold_mode", "eps", "min_lrs")
+
+
+class ApplyConfigOnResume(pl.Callback):
+    """Make the config, not the checkpoint, decide ReduceLROnPlateau and EarlyStopping settings on resume.
+
+    Lightning restores whole objects: ``ReduceLROnPlateau.load_state_dict`` overwrites patience, factor, ...
+    and ``EarlyStopping.load_state_dict`` overwrites patience with the values of the original run. This
+    callback records the values built from the config and puts them back in ``on_train_start``, which
+    runs after the checkpoint restore. Counters are kept: if ``num_bad_epochs`` (or ``wait_count``) is
+    already above the new patience, the next bad epoch reduces the lr (or stops training).
+    """
+
+    def __init__(self, scheduler=None, early_stopping=None):
+        self.plateau = None
+        if isinstance(scheduler, ReduceLROnPlateau):
+            self.plateau = {k: copy.deepcopy(getattr(scheduler, k)) for k in _PLATEAU_SETTINGS}
+            self.plateau_mode = scheduler.mode
+        self.es_patience = early_stopping.patience if early_stopping is not None else None
+
+    def on_train_start(self, trainer, pl_module):
+        changes = []
+        if self.plateau is not None:
+            for cfg in trainer.lr_scheduler_configs:
+                sched = cfg.scheduler
+                if not isinstance(sched, ReduceLROnPlateau):
+                    continue
+                if sched.mode != self.plateau_mode:
+                    raise ValueError(
+                        f"ReduceLROnPlateau mode changed from {sched.mode!r} (checkpoint) to "
+                        f"{self.plateau_mode!r} (config): the restored best value would be meaningless."
+                    )
+                for key, value in self.plateau.items():
+                    if getattr(sched, key) != value:
+                        changes.append(f"scheduler.{key}: {getattr(sched, key)} -> {value}")
+                        setattr(sched, key, copy.deepcopy(value))
+                sched._init_is_better(mode=sched.mode, threshold=sched.threshold, threshold_mode=sched.threshold_mode)
+                changes.append(f"(scheduler num_bad_epochs={sched.num_bad_epochs}, best={float(sched.best):.4f})")
+        if self.es_patience is not None:
+            for cb in trainer.callbacks:
+                if isinstance(cb, EarlyStopping) and cb.patience != self.es_patience:
+                    changes.append(f"early_stop.patience: {cb.patience} -> {self.es_patience}")
+                    cb.patience = self.es_patience
+        if trainer.is_global_zero:
+            print("Resume: settings from the config applied over the checkpoint: " + "; ".join(changes or ["none"]))

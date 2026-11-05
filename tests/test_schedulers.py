@@ -6,6 +6,7 @@ Run from the repository root:
 
 import math
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -267,6 +268,35 @@ class TrainerIntegrationTests(unittest.TestCase):
             self.assertTrue(cfg.reduce_on_plateau)
             self.assertEqual((cfg.interval, cfg.monitor), ("epoch", "val_loss"))
             self.assertTrue(all(lr == LR for _, lr in rec.records))
+
+    def test_resume_takes_plateau_and_early_stop_settings_from_config(self):
+        import pytorch_lightning as pl
+        from pytorch_lightning.callbacks import EarlyStopping
+
+        from look2hear.utils.checkpoint_utils import ApplyConfigOnResume
+
+        class Seen(pl.Callback):
+            def on_train_epoch_start(self, trainer, pl_module):
+                self.patience = trainer.lr_scheduler_configs[0].scheduler.patience
+                self.bad = trainer.lr_scheduler_configs[0].scheduler.num_bad_epochs
+                self.es = [cb.patience for cb in trainer.callbacks if isinstance(cb, EarlyStopping)][0]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            trainer, ckpt, _ = self._trainer(tmp, max_epochs=1, callbacks=[EarlyStopping("val_loss", patience=15)])
+            trainer.fit(self._module(lambda opt: ReduceLROnPlateau(opt, patience=10, factor=0.5)))
+            resume_from = os.path.join(tmp, "epoch0.ckpt")  # last.ckpt is overwritten by each resumed run
+            shutil.copy(ckpt.last_model_path, resume_from)
+            saved = torch.load(resume_from, map_location="cpu", weights_only=False)["lr_schedulers"][0]
+
+            for apply_config, expected in ((False, (10, 15)), (True, (3, 5))):
+                with self.subTest(apply_config=apply_config):
+                    module = self._module(lambda opt: ReduceLROnPlateau(opt, patience=3, factor=0.5))
+                    stop, seen = EarlyStopping("val_loss", patience=5), Seen()
+                    extra = [stop, seen] + ([ApplyConfigOnResume(module.scheduler, stop)] if apply_config else [])
+                    trainer2, _, _ = self._trainer(tmp, max_epochs=2, callbacks=extra)
+                    trainer2.fit(module, ckpt_path=resume_from)
+                    self.assertEqual((seen.patience, seen.es), expected)
+                    self.assertEqual(seen.bad, saved["num_bad_epochs"])  # progress still from the checkpoint
 
 
 if __name__ == "__main__":

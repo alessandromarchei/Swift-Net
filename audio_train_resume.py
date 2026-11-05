@@ -26,6 +26,7 @@ from look2hear.utils.checkpoint_utils import (
     load_audio_weights,
     migrate_checkpoint,
     LEGACY_MONITOR,
+    ApplyConfigOnResume,
     upgrade_legacy_monitor,
 )
 from look2hear.utils.visual_encoder import (
@@ -538,14 +539,18 @@ def main(
     callbacks.append(checkpoint)
 
     upgrade_legacy_monitor(config)
+    early_stopping = None
     if config["training"]["early_stop"]:
         print_only("Instantiating EarlyStopping")
 
-        callbacks.append(
-            EarlyStopping(
-                **config["training"]["early_stop"]
-            )
+        early_stopping = EarlyStopping(
+            **config["training"]["early_stop"]
         )
+        callbacks.append(early_stopping)
+
+    # The checkpoint restore overwrites ReduceLROnPlateau/EarlyStopping patience & co. with the values of
+    # the original run: put the ones of this config back once the restore is done.
+    callbacks.append(ApplyConfigOnResume(scheduler, early_stopping))
 
     # callbacks.append(
     #     MyRichProgressBar(
