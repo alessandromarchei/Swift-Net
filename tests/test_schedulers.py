@@ -21,6 +21,7 @@ import yaml
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from look2hear.system import ConstantCosineLR, WarmupCosineLR, make_scheduler
+from look2hear.system.schedulers import TwoStagePlateauLR
 
 LR = 1e-3
 MIN_LR = 1e-5
@@ -143,6 +144,46 @@ class ExistingSchedulerTests(unittest.TestCase):
     def test_warmup_cosine_still_built_by_name(self):
         sched = make_scheduler("WarmupCosineLR", make_optimizer(), warmup_epochs=1)
         self.assertIsInstance(sched, WarmupCosineLR)
+
+
+class TwoStagePlateauTests(unittest.TestCase):
+    def _drop_epochs(self, sched, opt, n=40):
+        drops, prev = [], opt.param_groups[0]["lr"]
+        for ep in range(n):
+            sched.step(1.0)  # constant loss: never improves after the first epoch
+            lr = opt.param_groups[0]["lr"]
+            if lr < prev:
+                drops.append(ep)
+            prev = lr
+        return drops
+
+    def test_without_second_patience_is_plain_plateau(self):
+        sched = make_scheduler("ReduceLROnPlateau", make_optimizer(), patience=10, factor=0.5)
+        self.assertIs(type(sched), ReduceLROnPlateau)
+        sched = make_scheduler("ReduceLROnPlateau", make_optimizer(), patience=10, patience_after_reduce=None)
+        self.assertIs(type(sched), ReduceLROnPlateau)
+
+    def test_patience_switches_after_first_reduction(self):
+        opt = make_optimizer()
+        sched = make_scheduler("ReduceLROnPlateau", opt, patience=10, factor=0.5, patience_after_reduce=2)
+        self.assertIsInstance(sched, TwoStagePlateauLR)
+        self.assertIsInstance(sched, ReduceLROnPlateau)
+        self.assertEqual(self._drop_epochs(sched, opt), [11, 14, 17, 20, 23, 26, 29, 32, 35, 38])
+        ref = make_optimizer()
+        self.assertEqual(self._drop_epochs(ReduceLROnPlateau(ref, patience=10, factor=0.5), ref)[0], 11)
+
+    def test_state_dict_roundtrip_and_plain_checkpoint(self):
+        opt = make_optimizer()
+        sched = make_scheduler("ReduceLROnPlateau", opt, patience=10, factor=0.5, patience_after_reduce=2)
+        self._drop_epochs(sched, opt, 12)
+        for state in (sched.state_dict(), {k: v for k, v in sched.state_dict().items()
+                                           if k not in ("initial_lrs", "initial_patience", "patience_after_reduce")}):
+            opt2 = make_optimizer()  # same order as a Lightning resume: build from config, then restore
+            s2 = make_scheduler("ReduceLROnPlateau", opt2, patience=10, factor=0.5, patience_after_reduce=2)
+            opt2.load_state_dict(opt.state_dict())
+            s2.load_state_dict(state)
+            self.assertTrue(s2.lr_was_reduced())
+            self.assertEqual(s2.update_patience(), 2)
 
 
 # ----------------------------------------------------------------------

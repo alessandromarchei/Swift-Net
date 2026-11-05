@@ -132,6 +132,10 @@ class ApplyConfigOnResume(pl.Callback):
         self.plateau = None
         if isinstance(scheduler, ReduceLROnPlateau):
             self.plateau = {k: copy.deepcopy(getattr(scheduler, k)) for k in _PLATEAU_SETTINGS}
+            # TwoStagePlateauLR: ``patience`` above is the initial-stage one; the stage is re-derived below
+            for k in ("initial_patience", "patience_after_reduce"):
+                if hasattr(scheduler, k):
+                    self.plateau[k] = getattr(scheduler, k)
             self.plateau_mode = scheduler.mode
         self.es_patience = early_stopping.patience if early_stopping is not None else None
 
@@ -148,9 +152,12 @@ class ApplyConfigOnResume(pl.Callback):
                         f"{self.plateau_mode!r} (config): the restored best value would be meaningless."
                     )
                 for key, value in self.plateau.items():
-                    if getattr(sched, key) != value:
-                        changes.append(f"scheduler.{key}: {getattr(sched, key)} -> {value}")
+                    if getattr(sched, key, None) != value:
+                        changes.append(f"scheduler.{key}: {getattr(sched, key, None)} -> {value}")
                         setattr(sched, key, copy.deepcopy(value))
+                if hasattr(sched, "update_patience"):
+                    sched.update_patience()
+                    changes.append(f"(two-stage plateau: lr reduced={sched.lr_was_reduced()}, active patience={sched.patience})")
                 sched._init_is_better(mode=sched.mode, threshold=sched.threshold, threshold_mode=sched.threshold_mode)
                 changes.append(f"(scheduler num_bad_epochs={sched.num_bad_epochs}, best={float(sched.best):.4f})")
         if self.es_patience is not None:

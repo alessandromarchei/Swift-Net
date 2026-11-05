@@ -1,7 +1,7 @@
 import math
 
 import torch
-from torch.optim.lr_scheduler import LRScheduler
+from torch.optim.lr_scheduler import LRScheduler, ReduceLROnPlateau
 
 
 class WarmupCosineLR(LRScheduler):
@@ -149,16 +149,48 @@ class ConstantCosineLR(LRScheduler):
             )
 
 
+class TwoStagePlateauLR(ReduceLROnPlateau):
+    """ReduceLROnPlateau whose patience changes after the first lr reduction.
+
+    ``patience`` is used while the lr is still the initial one; once any param group's lr has been
+    reduced, ``patience_after_reduce`` is used from then on. The stage is derived from the lr itself
+    (current lr vs ``initial_lrs``), so it is also correct when resuming from a checkpoint written by a
+    plain ReduceLROnPlateau. Built by ``make_scheduler("ReduceLROnPlateau", ..., patience_after_reduce=N)``.
+    """
+
+    def __init__(self, optimizer, patience_after_reduce, **kwargs):
+        super().__init__(optimizer, **kwargs)
+        self.initial_patience = self.patience
+        self.patience_after_reduce = int(patience_after_reduce)
+        self.initial_lrs = [float(g["lr"]) for g in optimizer.param_groups]
+
+    def lr_was_reduced(self):
+        return any(float(g["lr"]) < lr0 * (1 - 1e-9) for g, lr0 in zip(self.optimizer.param_groups, self.initial_lrs))
+
+    def update_patience(self):
+        self.patience = self.patience_after_reduce if self.lr_was_reduced() else self.initial_patience
+        return self.patience
+
+    def step(self, metrics, epoch=None):
+        self.update_patience()
+        super().step(metrics, epoch)
+        self.update_patience()  # switch right after the first reduction
+
+
 # Schedulers defined here, looked up by name before falling back to torch.optim.lr_scheduler
 _SCHEDULERS = {
     "WarmupCosineLR": WarmupCosineLR,
     "ConstantCosineLR": ConstantCosineLR,
     "constant_cosine": ConstantCosineLR,
+    "TwoStagePlateauLR": TwoStagePlateauLR,
 }
 
 
 def make_scheduler(sche_name, optimizer, **sche_config):
     """Build a scheduler from its name: a scheduler of this module or any ``torch.optim.lr_scheduler`` class."""
+    if sche_name == "ReduceLROnPlateau" and sche_config.get("patience_after_reduce") is not None:
+        return TwoStagePlateauLR(optimizer, **sche_config)
+    sche_config = {k: v for k, v in sche_config.items() if k != "patience_after_reduce"}
     if sche_name in _SCHEDULERS:
         return _SCHEDULERS[sche_name](optimizer, **sche_config)
     return getattr(torch.optim.lr_scheduler, sche_name)(optimizer=optimizer, **sche_config)
