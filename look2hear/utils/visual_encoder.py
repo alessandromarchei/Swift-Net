@@ -3,6 +3,7 @@
 Config, in the ``videonet`` block:
     freeze_visual_encoder: true   # default when absent. false: the encoder is updated with the separator.
     visual_lr: null               # encoder learning rate when trainable. null: the optimizer lr.
+    visual_weight_decay: null     # encoder weight decay when trainable. null: the optimizer weight_decay.
 
 A trainable encoder needs online visual input (datamodule.visual_features_path: null): precomputed
 embeddings have no encoder to update.
@@ -31,12 +32,12 @@ def validate_visual_training(trainable, visual_mode):
         )
 
 
-def build_optimizer_params(audio_model, video_model, trainable, visual_lr=None):
+def build_optimizer_params(audio_model, video_model, trainable, visual_lr=None, visual_weight_decay=None):
     """Parameters for make_optimizer.
 
     Frozen: the plain separator parameters, exactly as before.
-    Trainable: two groups. The separator uses the optimizer lr. The encoder uses ``visual_lr`` if given,
-    otherwise it inherits the optimizer lr.
+    Trainable: two groups. The separator uses the optimizer lr and weight decay. The encoder uses
+    ``visual_lr`` / ``visual_weight_decay`` if given, otherwise it inherits the optimizer values.
     """
     if not trainable:
         return audio_model.parameters()
@@ -44,6 +45,8 @@ def build_optimizer_params(audio_model, video_model, trainable, visual_lr=None):
     visual_group = {"params": list(video_model.parameters())}
     if visual_lr is not None:
         visual_group["lr"] = visual_lr
+    if visual_weight_decay is not None:
+        visual_group["weight_decay"] = visual_weight_decay
     return [{"params": list(audio_model.parameters())}, visual_group]
 
 

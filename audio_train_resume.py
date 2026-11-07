@@ -399,6 +399,7 @@ def main(
             video_model,
             visual_trainable,
             visual_lr=config["videonet"].get("visual_lr"),
+            visual_weight_decay=config["videonet"].get("visual_weight_decay"),
         ),
         **config["optimizer"],
     )
@@ -624,7 +625,9 @@ def main(
     print_only(
         f"Accelerator: {accelerator} | devices: {trainer.num_devices} | "
         f"per-device batch: {config['datamodule']['data_config']['batch_size']} | "
-        f"global batch: {config['datamodule']['data_config']['batch_size'] * trainer.num_devices}"
+        f"global batch: {config['datamodule']['data_config']['batch_size'] * trainer.num_devices} | "
+        f"effective batch (x accumulate_grad_batches): "
+        f"{config['datamodule']['data_config']['batch_size'] * trainer.num_devices * trainer.accumulate_grad_batches}"
     )
 
     # Checkpoint compatibility checks. Resuming requires the same architecture.

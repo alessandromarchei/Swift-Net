@@ -9,6 +9,7 @@ from .resnet1D import ResNet1D, BasicBlock1D
 from .shufflenetv2 import ShuffleNetV2
 from .frcnn_videomodel import FRCNNVideoModel, update_frcnn_parameter
 from .resnet_videomodel import ResNetVideoModel, update_resnet_parameter
+from .tiny_visual_encoder import TinyVisualEncoderModel, TinyVisualFrontend
 
 __all__ = [
     "WujianVideoModel",
@@ -19,6 +20,8 @@ __all__ = [
     "BasicBlock1D",
     "ShuffleNetV2",
     "FRCNNVideoModel",
+    "TinyVisualEncoderModel",
+    "TinyVisualFrontend",
     "update_frcnn_parameter",
     "LightVideomodel",
     "update_light_parameter",
