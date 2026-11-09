@@ -31,7 +31,7 @@ import yaml
 from torch.utils.data import DataLoader, Dataset
 
 import look2hear.videomodels
-from look2hear.datas.avspeech_dataset import AVSpeechDataset
+from look2hear.datas.avspeech_dataset import AVSpeechDataset, validate_visual_fps
 from look2hear.datas.transform import get_preprocessing_pipelines
 from look2hear.datas.visual_cache import (
     CACHE_FORMAT_VERSION,
@@ -43,7 +43,8 @@ from look2hear.datas.visual_cache import (
     write_rows,
 )
 
-FPS = 25  # visual frame rate of the mouth crops (dataset uses int(segment * 25) frames)
+# Default visual rate of the mouth crops (the dataset uses round(segment * visual_fps) frames).
+DEFAULT_FPS = 25.0
 
 
 def sha256_file(path, chunk=1 << 20):
@@ -54,7 +55,7 @@ def sha256_file(path, chunk=1 << 20):
     return h.hexdigest()
 
 
-def build_metadata(videonet_name, videonet_config, feature_dim, num_frames, segment, feature_dtype):
+def build_metadata(videonet_name, videonet_config, feature_dim, num_frames, segment, feature_dtype, input_fps):
     pretrain = videonet_config.get("pretrain")
     backbone = {
         "videonet_name": videonet_name,
@@ -71,7 +72,7 @@ def build_metadata(videonet_name, videonet_config, feature_dim, num_frames, segm
         "cache_format_version": CACHE_FORMAT_VERSION,
         "backbone": backbone,
         "preprocessing": preprocessing,
-        "input_fps": FPS,
+        "input_fps": input_fps,
         "segment_duration": segment,
         "num_frames": num_frames,
         "feature_dim": feature_dim,
@@ -139,7 +140,9 @@ def main(args):
 
     dc = conf["datamodule"]["data_config"]
     videonet = conf["videonet"]
-    num_frames = int(dc["segment"] * FPS)
+    # --visual_fps overrides the config, exactly as in audio_train.py; the cache records the rate it was built at.
+    fps = validate_visual_fps(args.visual_fps if args.visual_fps is not None else dc.get("visual_fps", DEFAULT_FPS))
+    num_frames = int(round(dc["segment"] * fps))
     feature_dim = 512
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     expected = build_metadata(
@@ -149,6 +152,7 @@ def main(args):
         num_frames,
         dc["segment"],
         args.dtype,
+        input_fps=fps,
     )
 
     keys = collect_keys(conf, args.splits)
@@ -243,6 +247,8 @@ def parse_args(argv=None):
     p.add_argument("--dtype", default="float32", choices=["float32", "float16"],
                    help="Storage dtype. float32 is the default and numerically closest to online inference.")
     p.add_argument("--cpu", action="store_true", help="Force CPU inference")
+    p.add_argument("--visual_fps", type=float, default=None,
+                   help="Visual frame rate (<= 25) the mouth .npz files are at. Default: datamodule.data_config.visual_fps, else 25.")
     p.add_argument("--verify_only", action="store_true", help="Only check the existing cache")
     return p.parse_args(argv)
 

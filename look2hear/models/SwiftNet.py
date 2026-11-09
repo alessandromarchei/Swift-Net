@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from torch.nn.modules.batchnorm import _BatchNorm
+from torch.utils.checkpoint import checkpoint as _activation_checkpoint
 from sru import SRU
 from .base_model import BaseModel
 from timm.models.layers import DropPath
@@ -1054,6 +1056,7 @@ class Separator(nn.Module):
         audio_bn_chan: int,
         video_bn_chan: int,
         fusion_params: dict,
+        activation_checkpointing: bool = False,
     ):
         super(Separator, self).__init__()
         self.audio_params = audio_params
@@ -1061,7 +1064,9 @@ class Separator(nn.Module):
         self.audio_bn_chan = audio_bn_chan
         self.video_bn_chan = video_bn_chan
         self.fusion_params = fusion_params
-        
+        # Recompute the activations of each block in backward instead of storing them (training only).
+        self.activation_checkpointing = activation_checkpointing
+
         self.fusion_repeats = self.video_params["repeats"]
         self.audio_repeats = self.audio_params["repeats"] - self.fusion_repeats
         self.video_repeat = self.video_params["repeats"]
@@ -1103,6 +1108,38 @@ class Separator(nn.Module):
             video_bn_chan=self.video_bn_chan,
             fusion_repeats=self.fusion_repeats)
         
+    def _run_block(self, block: nn.Module, *inputs):
+        """Run one separator block, optionally with activation checkpointing (training only).
+
+        With checkpointing the block's intermediate activations are not kept after the forward:
+        they are recomputed during backward from the block inputs. The output is the same.
+
+        BatchNorm caveat: the recomputation runs the block again in train mode, which would update
+        the BN running statistics a second time for the same batch. The first call (the real forward)
+        updates them; the recomputation runs with BN momentum set to 0 so the running stats stay
+        unchanged. Batch statistics used for normalization are identical in both passes.
+        """
+        if not (self.activation_checkpointing and self.training and torch.is_grad_enabled()):
+            return block(*inputs)
+
+        bn_layers = [m for m in block.modules() if isinstance(m, _BatchNorm)]
+        state = {"first_call": True}
+
+        def run(*args):
+            if state["first_call"]:
+                state["first_call"] = False
+                return block(*args)
+            saved = [bn.momentum for bn in bn_layers]
+            for bn in bn_layers:
+                bn.momentum = 0.0
+            try:
+                return block(*args)
+            finally:
+                for bn, momentum in zip(bn_layers, saved):
+                    bn.momentum = momentum
+
+        return _activation_checkpoint(run, *inputs, use_reentrant=False)
+
     def forward(self, audio: torch.Tensor, video: torch.Tensor):
         """
         Args:
@@ -1114,24 +1151,18 @@ class Separator(nn.Module):
         video_residual = video
         
         for i in range(self.fusion_repeats):
-            if self.audio_shared:
-                audio = self.audio_net(audio + audio_residual if i > 0 else audio)
-            else:
-                audio = self.audio_net[i](audio + audio_residual if i > 0 else audio)
-            if self.video_shared:
-                video = self.video_net(video + video_residual if i > 0 else video)
-            else:
-                video = self.video_net[i](video + video_residual if i > 0 else video)
-                
-            audio, video = self.caf.get_fusion_block(i)(audio, video)
+            audio_block = self.audio_net if self.audio_shared else self.audio_net[i]
+            audio = self._run_block(audio_block, audio + audio_residual if i > 0 else audio)
+            video_block = self.video_net if self.video_shared else self.video_net[i]
+            video = self._run_block(video_block, video + video_residual if i > 0 else video)
+
+            audio, video = self._run_block(self.caf.get_fusion_block(i), audio, video)
         
         # RTFSNet
         for j in range(self.audio_repeats):
             i = j + self.fusion_repeats
-            if self.audio_shared:
-                audio = self.audio_net(audio + audio_residual if i > 0 else audio)
-            else:
-                audio = self.audio_net[i](audio + audio_residual if i > 0 else audio)
+            audio_block = self.audio_net if self.audio_shared else self.audio_net[i]
+            audio = self._run_block(audio_block, audio + audio_residual if i > 0 else audio)
                 
         return audio
 
@@ -1380,7 +1411,8 @@ class SwiftNet(BaseModel):
         video_params: dict = dict(),
         fusion_params: dict = dict(),
         sample_rate=16000,
-        causal: bool = False,  
+        causal: bool = False,
+        activation_checkpointing: bool = False,
     ):
         super(SwiftNet, self).__init__(sample_rate=sample_rate)
         self.n_src = n_src
@@ -1409,6 +1441,7 @@ class SwiftNet(BaseModel):
             audio_bn_chan=self.audio_bn_params["out_chan"],
             video_bn_chan=self.pretrained_vout_chan,
             fusion_params=self.fusion_params,
+            activation_checkpointing=activation_checkpointing,
         )
         
         self.mask_generator = MaskGenerator(

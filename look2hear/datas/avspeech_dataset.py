@@ -14,6 +14,20 @@ from .transform import get_preprocessing_pipelines
 from .visual_cache import VisualFeatureCache, normalize_visual_key
 
 
+SOURCE_VISUAL_FPS = 25.0  # native frame rate of the mouth crops; lower rates are picked by frame index
+
+
+def validate_visual_fps(visual_fps):
+    """Return visual_fps as float, checking it is a usable rate for the mouth crops (0, 25]."""
+    fps = float(visual_fps)
+    if not (0.0 < fps <= SOURCE_VISUAL_FPS):
+        raise ValueError(
+            f"visual_fps must be in (0, {SOURCE_VISUAL_FPS:g}], got {visual_fps}. "
+            "Mouth crops are 25 fps; rates above it cannot be recovered."
+        )
+    return fps
+
+
 def normalize_tensor_wav(wav_tensor, eps=1e-8, std=None):
     mean = wav_tensor.mean(-1, keepdim=True)
     if std is None:
@@ -31,6 +45,7 @@ class AVSpeechDataset(Dataset):
         normalize_audio: bool = False,
         is_train: bool = True,
         visual_cache: VisualFeatureCache = None,
+        visual_fps: float = SOURCE_VISUAL_FPS,
     ):
         super().__init__()
         if json_dir == None:
@@ -42,6 +57,8 @@ class AVSpeechDataset(Dataset):
         self.normalize_audio = normalize_audio
         # If set, the dataset returns cached embeddings [D, T] instead of mouth crops.
         self.visual_cache = visual_cache
+        # Frame rate of the mouth sequences this run consumes (the .npz files must already be at this rate).
+        self.visual_fps = validate_visual_fps(visual_fps)
         self.lipreading_preprocessing_func = get_preprocessing_pipelines()[
             "train" if is_train else "val"
         ]
@@ -51,7 +68,8 @@ class AVSpeechDataset(Dataset):
             self.fps_len = None
         else:
             self.seg_len = int(segment * sample_rate)
-            self.fps_len = int(segment * 25)
+            # Frames covering the segment at this run's visual rate (25 fps -> int(segment * 25), as before).
+            self.fps_len = int(round(segment * self.visual_fps))
         self.n_src = n_src
         self.test = self.seg_len is None
         mix_json = os.path.join(json_dir, "mix.json")
@@ -221,6 +239,7 @@ class AVSpeechDataModule(object):
         pin_memory: bool = False,
         persistent_workers: bool = False,
         visual_features_path: str = None,
+        visual_fps: float = SOURCE_VISUAL_FPS,
     ) -> None:
         super().__init__()
         if train_dir == None or valid_dir == None or test_dir == None:
@@ -229,6 +248,8 @@ class AVSpeechDataModule(object):
             raise ValueError("{} is not in [1, 2]".format(n_src))
         # None: online mouth frames + FRCNNVideoModel. Path: precomputed embeddings (see scripts/precompute_visual_embeddings.py).
         self.visual_features_path = visual_features_path
+        # Visual frame rate of the run (<= 25). Must match the mouth .npz files and any precomputed cache.
+        self.visual_fps = validate_visual_fps(visual_fps)
 
         # this line allows to access init params with 'self.hparams' attribute
         self.train_dir = train_dir
@@ -253,6 +274,16 @@ class AVSpeechDataModule(object):
 
     def setup(self) -> None:
         cache = VisualFeatureCache(self.visual_features_path) if self.uses_cached_visual else None
+        if cache is not None:
+            # A cache built at another rate would silently misalign video and audio.
+            cache_fps = float(cache.metadata["input_fps"])
+            if cache_fps != self.visual_fps:
+                raise RuntimeError(
+                    f"Visual cache {self.visual_features_path} was built at {cache_fps:g} fps, "
+                    f"but this run uses visual_fps={self.visual_fps:g}. "
+                    "Rebuild it with scripts/precompute_visual_embeddings.py --visual_fps "
+                    f"{self.visual_fps:g}."
+                )
         self.data_train = AVSpeechDataset(
             json_dir = self.train_dir,
             n_src = self.n_src,
@@ -261,6 +292,7 @@ class AVSpeechDataModule(object):
             normalize_audio = self.normalize_audio,
             is_train=True,
             visual_cache=cache,
+            visual_fps=self.visual_fps,
         )
         self.data_val = AVSpeechDataset(
             json_dir = self.valid_dir,
@@ -270,6 +302,7 @@ class AVSpeechDataModule(object):
             normalize_audio = self.normalize_audio,
             is_train=False,
             visual_cache=cache,
+            visual_fps=self.visual_fps,
         )
         self.data_test = AVSpeechDataset(
             json_dir = self.test_dir,
@@ -279,6 +312,7 @@ class AVSpeechDataModule(object):
             normalize_audio = self.normalize_audio,
             is_train=False,
             visual_cache=cache,
+            visual_fps=self.visual_fps,
         )
         if cache is not None:
             # Fail before training if the cache does not cover every visual source of every split.
