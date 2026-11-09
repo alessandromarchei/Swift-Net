@@ -747,10 +747,15 @@ class FTGS(nn.Module):
             causal=self.causal,
             **self.layers["layer_2"]
         )
-        self.process_att = MultiHeadSelfAttention2D(
-            in_chan=self.hid_chan,
-            **self.layers["layer_3"]
-        )
+
+        if self.layers["layer_3"]["n_head"] > 1:
+            self.process_att = MultiHeadSelfAttention2D(
+                in_chan=self.hid_chan,
+                **self.layers["layer_3"]
+            )
+        else:
+            print("Warning: layer_3 n_head <= 1, skipping attention layer")
+            self.process_att = None
         
         # top down fusion 
         self.fusion_layers = nn.ModuleList([])
@@ -803,7 +808,8 @@ class FTGS(nn.Module):
         # global attention module
         global_features = self.process_f(global_features)
         global_features = self.process_t(global_features)
-        global_features = self.process_att(global_features)
+        if self.process_att is not None:
+            global_features = self.process_att(global_features)
 
         # Gather them now in reverse order
         x_fused = [self.fusion_layers[i](downsampled_outputs[i], global_features) for i in range(self.upsampling_depth)]
