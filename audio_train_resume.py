@@ -104,6 +104,17 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--visual_fps",
+    type=float,
+    default=None,
+    help=(
+        "Visual frame rate (<= 25) to resume at, e.g. 12.5 or 10. Must match the rate the run was "
+        "trained at, and the mouth .npz files (and any precomputed cache). Overrides "
+        "datamodule.data_config.visual_fps; default: that config value, else 25."
+    ),
+)
+
+parser.add_argument(
     "--wandb_run_id",
     type=str,
     default=None,
@@ -229,6 +240,7 @@ def main(
     compile_mode,
     wandb_run_id,
     accelerator="cuda",
+    visual_fps=None,
 ):
     checkpoint_path = validate_checkpoint_path(checkpoint_path)
 
@@ -305,6 +317,15 @@ def main(
     config["runtime"]["compile_mode"] = compile_mode
     config["runtime"]["wandb_run_id"] = wandb_run_id
     config["runtime"]["accelerator"] = accelerator
+
+    # Visual rate: the CLI flag wins over the config; the datamodule validates it and checks any cache.
+    if visual_fps is not None:
+        config["datamodule"]["data_config"]["visual_fps"] = visual_fps
+    print_only(
+        "Visual frame rate: {:g} fps".format(
+            config["datamodule"]["data_config"].get("visual_fps", 25.0)
+        )
+    )
 
     # pin_memory only accelerates host-to-GPU copies; it is not used on TPU.
     if accelerator == "xla" and config["datamodule"]["data_config"].get("pin_memory"):
@@ -793,4 +814,5 @@ if __name__ == "__main__":
         compile_mode=plain_args.compile_mode,
         wandb_run_id=plain_args.wandb_run_id,
         accelerator=plain_args.accelerator,
+        visual_fps=plain_args.visual_fps,
     )

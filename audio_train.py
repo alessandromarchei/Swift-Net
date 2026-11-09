@@ -112,6 +112,17 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "--visual_fps",
+    type=float,
+    default=None,
+    help=(
+        "Visual frame rate (<= 25) to train at, e.g. 12.5 or 10. The mouth .npz files (and any "
+        "precomputed cache) must be at this rate. Overrides datamodule.data_config.visual_fps; "
+        "default: that config value, else 25."
+    ),
+)
+
+parser.add_argument(
     "--wandb_run_id",
     type=str,
     default=None,
@@ -231,6 +242,7 @@ def main(
     init_ckpt=None,
     init_mode="strict",
     accelerator="cuda",
+    visual_fps=None,
 ):
     validate_accelerator_options(accelerator, precision, torch_compile_enabled)
     configure_numerical_precision(tf32_enabled, accelerator)
@@ -271,6 +283,15 @@ def main(
     config["runtime"]["init_ckpt"] = init_ckpt
     config["runtime"]["init_mode"] = init_mode
     config["runtime"]["accelerator"] = accelerator
+
+    # Visual rate: the CLI flag wins over the config; the datamodule validates it and checks any cache.
+    if visual_fps is not None:
+        config["datamodule"]["data_config"]["visual_fps"] = visual_fps
+    print_only(
+        "Visual frame rate: {:g} fps".format(
+            config["datamodule"]["data_config"].get("visual_fps", 25.0)
+        )
+    )
 
     # pin_memory only accelerates host-to-GPU copies; it is not used on TPU.
     if accelerator == "xla" and config["datamodule"]["data_config"].get("pin_memory"):
@@ -778,4 +799,5 @@ if __name__ == "__main__":
         init_ckpt=plain_args.init_ckpt,
         init_mode=plain_args.init_mode,
         accelerator=plain_args.accelerator,
+        visual_fps=plain_args.visual_fps,
     )
